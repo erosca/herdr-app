@@ -546,7 +546,7 @@ impl TerminalView {
             drop(g);
             self.send(&bytes);
         } else {
-            let rows = isize::from(g.vt.rows.max(1));
+            let rows = g.vt.rows.max(1) as isize;
             match by {
                 Scroll::Pages(n) => g.vt.scroll_viewport(n * rows),
                 Scroll::Lines(n) => g.vt.scroll_viewport(n),
