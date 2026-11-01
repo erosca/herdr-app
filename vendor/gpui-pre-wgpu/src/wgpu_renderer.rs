@@ -1,3 +1,4 @@
+use crate::damage::{self, Damage, DamageRect, TileHashes};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -10,7 +11,7 @@ use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smallvec::SmallVec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
@@ -43,6 +44,307 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
+
+/// HERDR: partial redraw (see `damage.rs`). Clears damaged rectangles of the retained frame;
+/// the clear color comes from the blend constant, so the shader needs no bindings.
+const RETAINED_CLEAR_SHADER: &str = r#"
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    return vec4<f32>(uv * 2.0 - vec2<f32>(1.0), 0.0, 1.0);
+}
+
+@fragment
+fn fs_clear() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
+}
+"#;
+
+/// HERDR: partial redraw: copies the retained frame, pixel for pixel, to the target.
+const RETAINED_BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var t_frame: texture_2d<f32>;
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    return vec4<f32>(uv * 2.0 - vec2<f32>(1.0), 0.0, 1.0);
+}
+
+@fragment
+fn fs_blit(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(t_frame, vec2<i32>(position.xy), 0);
+}
+"#;
+
+/// HERDR: whether windows redraw only what changed since the last frame (`damage.rs`).
+/// `HERDR_RENDER_PARTIAL=1` turns it on for every adapter, `=cpu` only for software
+/// rasterizers (llvmpipe, lavapipe, WARP), where full redraws cost the most.
+fn partial_redraw_requested(adapter: &wgpu::AdapterInfo) -> bool {
+    let enabled = match std::env::var("HERDR_RENDER_PARTIAL")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("1" | "on" | "true" | "all") => true,
+        Ok("cpu" | "auto" | "software") => adapter.device_type == wgpu::DeviceType::Cpu,
+        _ => false,
+    };
+    if enabled {
+        log::info!(
+            "partial redraw enabled for {} ({:?}, {:?})",
+            adapter.name,
+            adapter.backend,
+            adapter.device_type
+        );
+    }
+    enabled
+}
+
+/// HERDR: opt-in frame diagnostics, read once.
+///
+/// `HERDR_RENDER_TRACE=1` prints one `[HERDR_RENDER_TRACE]` line per window frame to stderr:
+/// CLOCK_MONOTONIC start time, how long acquiring, encoding+submitting and presenting took,
+/// what partial redraw redrew, and what the scene contains. `HERDR_RENDER_TRACE=sync` also
+/// waits for the GPU (or CPU rasterizer) to finish before presenting, so `raster_us` and
+/// `present_us` separate drawing from handing the frame to the window system (this
+/// serializes the two, so use it to measure, not to compare latency).
+///
+/// `HERDR_RENDER_SKIP=quads,shadows,paths,underlines,mono,subpixel,poly` leaves those
+/// primitive kinds out of every frame, to measure what each costs (the window will look
+/// wrong while it is set).
+struct RenderDiagnostics {
+    trace: bool,
+    sync: bool,
+    skip: SkipKinds,
+}
+
+#[derive(Default)]
+struct SkipKinds {
+    quads: bool,
+    shadows: bool,
+    paths: bool,
+    underlines: bool,
+    monochrome: bool,
+    subpixel: bool,
+    polychrome: bool,
+}
+
+fn render_diagnostics() -> &'static RenderDiagnostics {
+    static DIAGNOSTICS: std::sync::OnceLock<RenderDiagnostics> = std::sync::OnceLock::new();
+    DIAGNOSTICS.get_or_init(|| {
+        let trace = std::env::var("HERDR_RENDER_TRACE").unwrap_or_default();
+        let trace = trace.trim();
+        let mut skip = SkipKinds::default();
+        for kind in std::env::var("HERDR_RENDER_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+        {
+            match kind {
+                "quads" => skip.quads = true,
+                "shadows" => skip.shadows = true,
+                "paths" => skip.paths = true,
+                "underlines" => skip.underlines = true,
+                "mono" => skip.monochrome = true,
+                "subpixel" => skip.subpixel = true,
+                "poly" => skip.polychrome = true,
+                _ => {}
+            }
+        }
+        RenderDiagnostics {
+            trace: !trace.is_empty() && trace != "0",
+            sync: trace == "sync",
+            skip,
+        }
+    })
+}
+
+/// `std::time::Instant::now` panics on wasm, where frame timing is simply left out.
+fn timestamp() -> Option<std::time::Instant> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        Some(std::time::Instant::now())
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        None
+    }
+}
+
+fn micros_between(start: Option<std::time::Instant>, end: Option<std::time::Instant>) -> u128 {
+    match (start, end) {
+        (Some(start), Some(end)) => end.saturating_duration_since(start).as_micros(),
+        _ => 0,
+    }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds, the clock Python's `time.monotonic_ns()` reads, so trace
+/// lines can be lined up with when a terminal program wrote its output.
+fn monotonic_ns() -> u128 {
+    #[cfg(unix)]
+    {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid, writable timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0 {
+            return now.tv_sec as u128 * 1_000_000_000 + now.tv_nsec as u128;
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// What the scene holds, for `HERDR_RENDER_TRACE`: primitive counts and the area they cover
+/// (thousands of pixels, overlaps counted every time), i.e. how much each kind rasterizes.
+fn scene_inventory(scene: &Scene) -> String {
+    fn kpx(bounds: &Bounds<ScaledPixels>, mask: &Bounds<ScaledPixels>, grow: f32) -> f64 {
+        let x0 = (bounds.origin.x.0 - grow).max(mask.origin.x.0);
+        let y0 = (bounds.origin.y.0 - grow).max(mask.origin.y.0);
+        let x1 = (bounds.origin.x.0 + bounds.size.width.0 + grow)
+            .min(mask.origin.x.0 + mask.size.width.0);
+        let y1 = (bounds.origin.y.0 + bounds.size.height.0 + grow)
+            .min(mask.origin.y.0 + mask.size.height.0);
+        f64::from((x1 - x0).max(0.0) * (y1 - y0).max(0.0)) / 1000.0
+    }
+    let quad_kpx: f64 = scene
+        .quads
+        .iter()
+        .map(|q| kpx(&q.bounds, &q.content_mask.bounds, 0.0))
+        .sum();
+    let shadow_kpx: f64 = scene
+        .shadows
+        .iter()
+        .map(|s| {
+            kpx(
+                &s.bounds,
+                &s.content_mask.bounds,
+                3.0 * s.blur_radius.0.abs(),
+            )
+        })
+        .sum();
+    let path_kpx: f64 = scene
+        .paths
+        .iter()
+        .map(|p| kpx(&p.bounds, &p.content_mask.bounds, 0.0))
+        .sum();
+    let mono_kpx: f64 = scene
+        .monochrome_sprites
+        .iter()
+        .map(|s| kpx(&s.bounds, &s.content_mask.bounds, 0.0))
+        .sum();
+    let subpixel_kpx: f64 = scene
+        .subpixel_sprites
+        .iter()
+        .map(|s| kpx(&s.bounds, &s.content_mask.bounds, 0.0))
+        .sum();
+    let poly_kpx: f64 = scene
+        .polychrome_sprites
+        .iter()
+        .map(|s| kpx(&s.bounds, &s.content_mask.bounds, 0.0))
+        .sum();
+    let mut batches = 0;
+    let mut path_batches = 0;
+    for batch in scene.batches() {
+        batches += 1;
+        if matches!(batch, PrimitiveBatch::Paths(_)) {
+            path_batches += 1;
+        }
+    }
+    format!(
+        "batches={batches} quads={} quad_kpx={:.0} shadows={} shadow_kpx={:.0} paths={} \
+         path_batches={path_batches} path_kpx={:.0} underlines={} mono={} mono_kpx={:.0} \
+         subpixel={} subpixel_kpx={:.0} poly={} poly_kpx={:.0}",
+        scene.quads.len(),
+        quad_kpx,
+        scene.shadows.len(),
+        shadow_kpx,
+        scene.paths.len(),
+        path_kpx,
+        scene.underlines.len(),
+        scene.monochrome_sprites.len(),
+        mono_kpx,
+        scene.subpixel_sprites.len(),
+        subpixel_kpx,
+        scene.polychrome_sprites.len(),
+        poly_kpx,
+    )
+}
+
+/// The instances of one batch to draw: all of them, or (partial redraw) per damaged
+/// rectangle the runs of instances that can reach it, drawn through that rectangle's scissor.
+enum Draws {
+    All(Range<u32>),
+    Runs(SmallVec<[(DamageRect, Range<u32>); 8]>),
+}
+
+impl Draws {
+    fn new<T>(
+        instances: &[T],
+        range: Range<usize>,
+        scissors: Option<&[DamageRect]>,
+        area: impl Fn(&T) -> [f32; 4],
+    ) -> Self {
+        match scissors {
+            None => Draws::All(instance_range(range)),
+            Some(rects) => {
+                let start = range.start as u32;
+                let mut runs = damage::visible_runs(&instances[range], rects, area);
+                for (_, run) in &mut runs {
+                    *run = start + run.start..start + run.end;
+                }
+                Draws::Runs(runs)
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Draws::All(range) => range.is_empty(),
+            Draws::Runs(runs) => runs.is_empty(),
+        }
+    }
+
+    /// Issues the draws; `first_instance` offsets the instance ranges into the binding.
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, first_instance: u32) {
+        match self {
+            Draws::All(range) => pass.draw(
+                0..4,
+                first_instance + range.start..first_instance + range.end,
+            ),
+            Draws::Runs(runs) => {
+                let mut scissor = None;
+                for (rect, run) in runs {
+                    if scissor != Some(*rect) {
+                        pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                        scissor = Some(*rect);
+                    }
+                    pass.draw(0..4, first_instance + run.start..first_instance + run.end);
+                }
+            }
+        }
+    }
+}
+
+/// Draws through each damage rectangle in turn, or once without a scissor.
+fn draw_scissored(
+    pass: &mut wgpu::RenderPass<'_>,
+    scissors: Option<&[DamageRect]>,
+    mut draw: impl FnMut(&mut wgpu::RenderPass<'_>),
+) {
+    match scissors {
+        None => draw(pass),
+        Some(rects) => {
+            for rect in rects {
+                pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                draw(pass);
+            }
+        }
+    }
+}
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -194,6 +496,49 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    // HERDR: partial redraw state, created on first use.
+    retained_pipelines: Option<RetainedPipelines>,
+    retained_frame: Option<RetainedFrame>,
+}
+
+/// HERDR: pipelines that clear damaged rectangles of the retained frame and copy it out.
+struct RetainedPipelines {
+    clear: wgpu::RenderPipeline,
+    blit: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+}
+
+/// HERDR: the last frame's pixels, kept so the next frame redraws only what changed.
+struct RetainedFrame {
+    view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
+    size: Size<DevicePixels>,
+    /// What the texture shows; `None` until a complete frame was drawn into it.
+    contents: Option<RetainedContents>,
+}
+
+struct RetainedContents {
+    tiles: TileHashes,
+    key: RetainedKey,
+}
+
+/// Everything besides the scene that decides a frame's pixels. A change redraws everything.
+#[derive(PartialEq)]
+struct RetainedKey {
+    premultiplied_alpha: bool,
+    clear_color: [u64; 4],
+    is_bgr: bool,
+    atlas_epoch: u64,
+}
+
+/// What a submitted frame redrew, for `HERDR_RENDER_TRACE`.
+struct FrameReport {
+    submission: wgpu::SubmissionIndex,
+    partial: bool,
+    full: bool,
+    redrawn_pixels: u64,
+    rects: usize,
+    hash_micros: u128,
 }
 
 struct CachedTextureBindGroup {
@@ -207,6 +552,14 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.retained_frame = None;
+    }
+
+    /// HERDR: the retained frame may not match what was drawn (GPU errors); redraw it all.
+    fn forget_retained_frame(&mut self) {
+        if let Some(frame) = self.retained_frame.as_mut() {
+            frame.contents = None;
+        }
     }
 }
 
@@ -225,6 +578,11 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    // HERDR: windows redraw only damaged tiles (`partial_redraw_requested`).
+    partial_redraw: bool,
+    // HERDR: set while recording when something could not be drawn (a sprite texture the
+    // atlas released, a missing path texture), so the retained frame is not trusted.
+    frame_incomplete: Cell<bool>,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1204,6 +1562,8 @@ impl WgpuRenderer {
             self.device_errors
                 .observe_error(&mut self.observed_error_generation)
         }) {
+            // HERDR: the retained frame may not hold what was meant to be drawn.
+            core.resources.forget_retained_frame();
             self.failed_frame_count += 1;
             log::error!(
                 "GPU error during frame (failure {} of 10): {error}",
@@ -1224,6 +1584,9 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
+        let diagnostics = render_diagnostics();
+        let started_ns = if diagnostics.trace { monotonic_ns() } else { 0 };
+        let started = timestamp();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -1256,19 +1619,80 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
-        if let Err(error) = core.render_frame(
-            scene,
-            &frame_view,
-            size,
-            premultiplied_alpha,
-            wgpu::Color::TRANSPARENT,
-        ) {
-            log::error!("{error:#}");
-            return false;
+        let acquired = timestamp();
+        let rendered = if core.partial_redraw {
+            core.render_frame_retained(
+                scene,
+                &frame_view,
+                size,
+                premultiplied_alpha,
+                wgpu::Color::TRANSPARENT,
+            )
+        } else {
+            core.render_frame(
+                scene,
+                &frame_view,
+                size,
+                premultiplied_alpha,
+                wgpu::Color::TRANSPARENT,
+            )
+            .map(|submission| FrameReport {
+                submission,
+                partial: false,
+                full: true,
+                redrawn_pixels: size.width.0 as u64 * size.height.0 as u64,
+                rects: 0,
+                hash_micros: 0,
+            })
+        };
+        let report = match rendered {
+            Ok(report) => report,
+            Err(error) => {
+                log::error!("{error:#}");
+                return false;
+            }
+        };
+        let submitted = timestamp();
+        if diagnostics.sync
+            && let Err(error) = core.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(report.submission.clone()),
+                timeout: None,
+            })
+        {
+            log::warn!("HERDR_RENDER_TRACE=sync could not wait for the frame: {error:?}");
         }
+        let rasterized = timestamp();
+        let inventory = if diagnostics.trace {
+            scene_inventory(scene)
+        } else {
+            String::new()
+        };
 
         self.scene_valid = true;
         frame.present();
+
+        if diagnostics.trace {
+            let presented = timestamp();
+            // `acquire_us`, `submit_us`, `present_us`, `total_us`, `width` and `height` keep the
+            // format of the earlier external timing patch, so its report script still reads it.
+            eprintln!(
+                "[HERDR_RENDER_TRACE] t_ns={started_ns} acquire_us={} submit_us={} raster_us={} \
+                 present_us={} total_us={} width={} height={} partial={} full={} redraw_kpx={} \
+                 rects={} hash_us={} {inventory}",
+                micros_between(started, acquired),
+                micros_between(acquired, submitted),
+                micros_between(submitted, rasterized),
+                micros_between(rasterized, presented),
+                micros_between(started, presented),
+                size.width.0,
+                size.height.0,
+                u8::from(report.partial),
+                u8::from(report.full),
+                report.redrawn_pixels / 1000,
+                report.rects,
+                report.hash_micros,
+            );
+        }
         true
     }
 }
@@ -1529,6 +1953,8 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                retained_pipelines: None,
+                retained_frame: None,
             },
             atlas,
             path_globals_offset,
@@ -1540,9 +1966,11 @@ impl WgpuRendererCore {
             rendering_params,
             is_bgr: false,
             dual_source_blending,
+            partial_redraw: partial_redraw_requested(&context.adapter.get_info()),
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            frame_incomplete: Cell::new(false),
         }
     }
 
@@ -1598,6 +2026,92 @@ impl WgpuRendererCore {
         premultiplied_alpha: bool,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
+        self.prepare_frame(size, premultiplied_alpha)?;
+        self.record_frame(scene, target_view, clear_color, None, None)
+            .inspect_err(|_| {
+                // Queue writes are staged before encoding; flush them even if the frame fails.
+                self.resources.queue.submit(std::iter::empty());
+            })
+    }
+
+    /// HERDR: like `render_frame`, but draws into the retained frame, redrawing only the
+    /// tiles whose primitives changed since the frame it holds, then copies it to
+    /// `target_view`. See `damage.rs`.
+    fn render_frame_retained(
+        &mut self,
+        scene: &Scene,
+        target_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        premultiplied_alpha: bool,
+        clear_color: wgpu::Color,
+    ) -> Result<FrameReport> {
+        self.prepare_frame(size, premultiplied_alpha)?;
+        self.ensure_retained_frame(size);
+
+        let hash_start = timestamp();
+        let tiles = TileHashes::of_scene(scene, size);
+        let key = RetainedKey {
+            premultiplied_alpha,
+            clear_color: [
+                clear_color.r.to_bits(),
+                clear_color.g.to_bits(),
+                clear_color.b.to_bits(),
+                clear_color.a.to_bits(),
+            ],
+            is_bgr: self.is_bgr,
+            // Read after `prepare_frame` flushed this frame's uploads.
+            atlas_epoch: self.atlas.content_epoch(),
+        };
+        let retained = self
+            .resources
+            .retained_frame
+            .as_mut()
+            .context("retained frame was not created")?;
+        let damage = match retained.contents.take() {
+            Some(previous) if previous.key == key => tiles.damage_since(&previous.tiles),
+            _ => Damage::Full,
+        };
+        let hash_micros = micros_between(hash_start, timestamp());
+        let view = retained.view.clone();
+        let blit_bind_group = retained.blit_bind_group.clone();
+
+        let scissors = match &damage {
+            Damage::Full => None,
+            Damage::Nothing => Some(&[][..]),
+            Damage::Rects(rects) => Some(&rects[..]),
+        };
+        self.frame_incomplete.set(false);
+        let submission = self
+            .record_frame(
+                scene,
+                &view,
+                clear_color,
+                scissors,
+                Some((target_view, &blit_bind_group)),
+            )
+            .inspect_err(|_| {
+                self.resources.queue.submit(std::iter::empty());
+            })?;
+        if !self.frame_incomplete.get()
+            && let Some(retained) = self.resources.retained_frame.as_mut()
+        {
+            retained.contents = Some(RetainedContents { tiles, key });
+        }
+        Ok(FrameReport {
+            submission,
+            partial: true,
+            full: damage == Damage::Full,
+            redrawn_pixels: damage.area(size),
+            rects: match &damage {
+                Damage::Rects(rects) => rects.len(),
+                Damage::Full | Damage::Nothing => 0,
+            },
+            hash_micros,
+        })
+    }
+
+    /// Validates the target size, flushes atlas uploads and writes the frame's globals.
+    fn prepare_frame(&mut self, size: Size<DevicePixels>, premultiplied_alpha: bool) -> Result<()> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
             "invalid render target size: {size:?}"
@@ -1643,20 +2157,207 @@ impl WgpuRendererCore {
             self.gamma_offset,
             bytemuck::bytes_of(&gamma_params),
         );
-
-        self.record_frame(scene, target_view, clear_color)
-            .inspect_err(|_| {
-                // Queue writes are staged before encoding; flush them even if the frame fails.
-                self.resources.queue.submit(std::iter::empty());
-            })
+        Ok(())
     }
 
+    /// HERDR: creates the partial redraw pipelines and a retained frame of `size`.
+    fn ensure_retained_frame(&mut self, size: Size<DevicePixels>) {
+        let device = Arc::clone(&self.resources.device);
+        let format = self.target_format;
+        let pipelines = self
+            .resources
+            .retained_pipelines
+            .get_or_insert_with(|| Self::create_retained_pipelines(&device, format));
+        if self
+            .resources
+            .retained_frame
+            .as_ref()
+            .is_some_and(|frame| frame.size == size)
+        {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("retained_frame"),
+            size: wgpu::Extent3d {
+                width: size.width.0 as u32,
+                height: size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("retained_frame_bind_group"),
+            layout: &pipelines.blit_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        self.resources.retained_frame = Some(RetainedFrame {
+            view,
+            blit_bind_group,
+            size,
+            contents: None,
+        });
+    }
+
+    fn create_retained_pipelines(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> RetainedPipelines {
+        let clear_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("retained_clear_shader"),
+            source: wgpu::ShaderSource::Wgsl(RETAINED_CLEAR_SHADER.into()),
+        });
+        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("retained_blit_shader"),
+            source: wgpu::ShaderSource::Wgsl(RETAINED_BLIT_SHADER.into()),
+        });
+        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("retained_blit_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pipeline = |name: &str,
+                        layouts: &[Option<&wgpu::BindGroupLayout>],
+                        module: &wgpu::ShaderModule,
+                        fs_entry: &str,
+                        blend: Option<wgpu::BlendState>| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_layout")),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_fullscreen"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // The fragment shader returns 1.0; blending with the constant as source factor and
+        // zero for the destination writes the blend constant, i.e. the clear color.
+        let constant = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Constant,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        };
+        RetainedPipelines {
+            clear: pipeline(
+                "retained_clear",
+                &[],
+                &clear_module,
+                "fs_clear",
+                Some(wgpu::BlendState {
+                    color: constant,
+                    alpha: constant,
+                }),
+            ),
+            blit: pipeline(
+                "retained_blit",
+                &[Some(&blit_layout)],
+                &blit_module,
+                "fs_blit",
+                None,
+            ),
+            blit_layout,
+        }
+    }
+
+    /// Draws `scene` into `frame_view`. With `scissors`, only those rectangles are cleared
+    /// and redrawn and the rest of `frame_view` is kept (an empty list draws nothing). With
+    /// `blit_to`, the finished frame is then copied to that target through the bind group.
     fn record_frame(
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
+        scissors: Option<&[DamageRect]>,
+        blit_to: Option<(&wgpu::TextureView, &wgpu::BindGroup)>,
     ) -> Result<wgpu::SubmissionIndex> {
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("main_encoder"),
+                });
+        if scissors.is_none_or(|rects| !rects.is_empty()) {
+            self.record_scene(scene, &mut encoder, frame_view, clear_color, scissors)?;
+        }
+        if let Some((target, bind_group)) = blit_to {
+            let pipelines = self
+                .resources()
+                .retained_pipelines
+                .as_ref()
+                .context("retained frame pipelines were not created")?;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("retained_blit_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipelines.blit);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let submission = self
+            .resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(submission)
+    }
+
+    fn record_scene(
+        &mut self,
+        scene: &Scene,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        clear_color: wgpu::Color,
+        scissors: Option<&[DamageRect]>,
+    ) -> Result<()> {
+        let skip = &render_diagnostics().skip;
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1674,13 +2375,6 @@ impl WgpuRendererCore {
             })?;
         self.prepare_texture_bind_groups(scene);
 
-        let mut encoder =
-            self.resources()
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main_encoder"),
-                });
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1688,7 +2382,12 @@ impl WgpuRendererCore {
                     view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        // HERDR: a partial redraw keeps the pixels outside its rectangles.
+                        load: if scissors.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(clear_color)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1697,18 +2396,37 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
+            if let Some(rects) = scissors {
+                // Clear just the damaged rectangles; see `create_retained_pipelines`.
+                let pipelines = self
+                    .resources()
+                    .retained_pipelines
+                    .as_ref()
+                    .context("retained frame pipelines were not created")?;
+                pass.set_pipeline(&pipelines.clear);
+                pass.set_blend_constant(clear_color);
+                draw_scissored(&mut pass, Some(rects), |pass| pass.draw(0..3, 0..1));
+            }
+
             for batch in scene.batches() {
                 match batch {
+                    PrimitiveBatch::Quads(_) if skip.quads => {}
+                    PrimitiveBatch::Shadows(_) if skip.shadows => {}
+                    PrimitiveBatch::Paths(_) if skip.paths => {}
+                    PrimitiveBatch::Underlines(_) if skip.underlines => {}
+                    PrimitiveBatch::MonochromeSprites { .. } if skip.monochrome => {}
+                    PrimitiveBatch::SubpixelSprites { .. } if skip.subpixel => {}
+                    PrimitiveBatch::PolychromeSprites { .. } if skip.polychrome => {}
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
                         &self.resources().pipelines.quads,
-                        instance_range(range),
+                        &Draws::new(&scene.quads, range, scissors, damage::quad_area),
                         &mut pass,
                     ),
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
-                        instance_range(range),
+                        &Draws::new(&scene.shadows, range, scissors, damage::shadow_area),
                         &mut pass,
                     ),
                     PrimitiveBatch::Paths(range) => {
@@ -1716,13 +2434,20 @@ impl WgpuRendererCore {
                         if paths.is_empty() {
                             continue;
                         }
+                        // HERDR: a path batch rasterizes into a full-size texture first; skip
+                        // it when none of its paths reaches a damaged rectangle.
+                        if let Some(rects) = scissors
+                            && !paths.iter().any(|path| {
+                                let bounds = path.clipped_bounds();
+                                rects.iter().any(|rect| rect.touches(&bounds))
+                            })
+                        {
+                            continue;
+                        }
 
                         drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            paths,
-                            &mut instance_offset,
-                        )?;
+                        let rasterized =
+                            self.draw_paths_to_intermediate(encoder, paths, &mut instance_offset)?;
 
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_pass_continued"),
@@ -1743,14 +2468,17 @@ impl WgpuRendererCore {
                             self.draw_paths_from_intermediate(
                                 paths,
                                 &mut instance_offset,
+                                scissors,
                                 &mut pass,
                             )?;
+                        } else {
+                            self.frame_incomplete.set(true);
                         }
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
                         &self.resources().pipelines.underlines,
-                        instance_range(range),
+                        &Draws::new(&scene.underlines, range, scissors, damage::underline_area),
                         &mut pass,
                     ),
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -1758,7 +2486,12 @@ impl WgpuRendererCore {
                             &instance_bindings.monochrome_sprites,
                             texture_id,
                             &self.resources().pipelines.mono_sprites,
-                            instance_range(range),
+                            &Draws::new(
+                                &scene.monochrome_sprites,
+                                range,
+                                scissors,
+                                damage::monochrome_area,
+                            ),
                             &mut pass,
                         )?;
                     }
@@ -1772,7 +2505,12 @@ impl WgpuRendererCore {
                                 .subpixel_sprites
                                 .as_ref()
                                 .unwrap_or(&resources.pipelines.mono_sprites),
-                            instance_range(range),
+                            &Draws::new(
+                                &scene.subpixel_sprites,
+                                range,
+                                scissors,
+                                damage::subpixel_area,
+                            ),
                             &mut pass,
                         )?;
                     }
@@ -1781,7 +2519,12 @@ impl WgpuRendererCore {
                             &instance_bindings.polychrome_sprites,
                             texture_id,
                             &self.resources().pipelines.poly_sprites,
-                            instance_range(range),
+                            &Draws::new(
+                                &scene.polychrome_sprites,
+                                range,
+                                scissors,
+                                damage::polychrome_area,
+                            ),
                             &mut pass,
                         )?;
                     }
@@ -1791,12 +2534,7 @@ impl WgpuRendererCore {
                 }
             }
         }
-
-        let submission = self
-            .resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        Ok(submission)
+        Ok(())
     }
 
     fn write_instances(
@@ -1912,19 +2650,16 @@ impl WgpuRendererCore {
         &self,
         instances: &InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
-        range: Range<u32>,
+        draws: &Draws,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
-        if range.is_empty() {
+        if draws.is_empty() {
             return;
         }
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.draw(
-            0..4,
-            instances.first_instance + range.start..instances.first_instance + range.end,
-        );
+        draws.draw(pass, instances.first_instance);
     }
 
     fn draw_sprites(
@@ -1932,27 +2667,25 @@ impl WgpuRendererCore {
         sprite_instances: &InstanceBinding,
         texture_id: AtlasTextureId,
         pipeline: &wgpu::RenderPipeline,
-        range: Range<u32>,
+        draws: &Draws,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
-        if range.is_empty() {
+        if draws.is_empty() {
             return Ok(());
         }
         let resources = self.resources();
         // The atlas has released this texture; the batch belongs to a stale
         // paint that will be replaced once its view re-renders.
         let Some(texture) = resources.atlas_texture_bind_groups.get(&texture_id) else {
+            // HERDR: the retained frame now lacks these sprites; redraw it all next frame.
+            self.frame_incomplete.set(true);
             return Ok(());
         };
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
-        pass.draw(
-            0..4,
-            sprite_instances.first_instance + range.start
-                ..sprite_instances.first_instance + range.end,
-        );
+        draws.draw(pass, sprite_instances.first_instance);
         Ok(())
     }
 
@@ -1969,6 +2702,7 @@ impl WgpuRendererCore {
         &mut self,
         paths: &[Path<ScaledPixels>],
         instance_offset: &mut u64,
+        scissors: Option<&[DamageRect]>,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
         let first_path = &paths[0];
@@ -2002,10 +2736,8 @@ impl WgpuRendererCore {
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
-        pass.draw(
-            0..4,
-            instances.first_instance..instances.first_instance + sprites.len() as u32,
-        );
+        let instances = instances.first_instance..instances.first_instance + sprites.len() as u32;
+        draw_scissored(pass, scissors, |pass| pass.draw(0..4, instances.clone()));
         Ok(())
     }
 
@@ -2587,6 +3319,40 @@ impl WgpuHeadlessRenderer {
         Ok(())
     }
 
+    /// HERDR: renders like a window with partial redraw on: only what changed since the
+    /// previous call is redrawn into the retained frame, which is then copied to the target.
+    pub fn render_scene_retained(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<u64> {
+        self.check_gpu_errors()?;
+        self.ensure_render_target(size)?;
+        let view = self
+            .render_target
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
+            .view
+            .clone();
+        let report =
+            self.core
+                .render_frame_retained(scene, &view, size, false, wgpu::Color::BLACK)?;
+        Ok(report.redrawn_pixels)
+    }
+
+    /// HERDR: blocks until submitted rendering has finished, for benchmarks.
+    pub fn wait_for_gpu(&self) -> anyhow::Result<()> {
+        self.core
+            .resources
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(())
+    }
+
     fn read_image(&mut self) -> anyhow::Result<image::RgbaImage> {
         let target = self
             .render_target
@@ -3001,5 +3767,592 @@ mod tests {
                 33.0_f32.to_bits(),
             ]
         );
+    }
+
+    // HERDR: partial redraw (`damage.rs`). Frames drawn with partial redraw must match full
+    // redraws pixel for pixel, whatever changes between them.
+
+    #[cfg(target_os = "linux")]
+    use gpui::{
+        AtlasKey, AtlasTile, FontId, GlyphId, ImageId, PlatformAtlas, RenderGlyphParams,
+        RenderImageParams, TransformationMatrix, point, px,
+    };
+
+    #[cfg(target_os = "linux")]
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn corners(radius: f32) -> Corners<ScaledPixels> {
+        Corners {
+            top_left: ScaledPixels(radius),
+            top_right: ScaledPixels(radius),
+            bottom_right: ScaledPixels(radius),
+            bottom_left: ScaledPixels(radius),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn panel(bounds: Bounds<ScaledPixels>, mask: ContentMask<ScaledPixels>, radius: f32) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: mask,
+            background: gpui::hsla(0.6, 0.2, 0.15, 1.0).into(),
+            border_color: gpui::hsla(0.6, 0.3, 0.4, 1.0),
+            corner_radii: corners(radius),
+            border_widths: Edges {
+                top: ScaledPixels(1.0),
+                right: ScaledPixels(1.0),
+                bottom: ScaledPixels(1.0),
+                left: ScaledPixels(1.0),
+            },
+        }
+    }
+
+    /// A glyph-like 8x16 alpha mask; `seed` picks the pattern and the atlas key.
+    #[cfg(target_os = "linux")]
+    fn glyph_tile(atlas: &dyn PlatformAtlas, seed: u32) -> AtlasTile {
+        let key = AtlasKey::Glyph(RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id: GlyphId(seed),
+            font_size: px(14.0),
+            subpixel_variant: Point::default(),
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        });
+        let bytes: Vec<u8> = (0..8 * 16u32)
+            .map(|i| {
+                let (x, y) = (i % 8, i / 8);
+                if (x + y + seed).is_multiple_of(3) || x == seed % 8 {
+                    255
+                } else {
+                    (x * 23 + y * 7 + seed * 41) as u8
+                }
+            })
+            .collect();
+        atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    device_size(8, 16),
+                    std::borrow::Cow::Owned(bytes.clone()),
+                )))
+            })
+            .expect("atlas insert")
+            .expect("atlas tile")
+    }
+
+    /// A 16x16 BGRA icon.
+    #[cfg(target_os = "linux")]
+    fn icon_tile(atlas: &dyn PlatformAtlas, seed: usize) -> AtlasTile {
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(seed),
+            frame_index: 0,
+        });
+        let bytes: Vec<u8> = (0..16 * 16usize)
+            .flat_map(|i| {
+                let (x, y) = (i % 16, i / 16);
+                let alpha = if (x as i32 - 8).pow(2) + (y as i32 - 8).pow(2) < 49 {
+                    255
+                } else {
+                    0
+                };
+                [(x * 16) as u8, (y * 16) as u8, (seed * 60) as u8, alpha]
+            })
+            .collect();
+        atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    device_size(16, 16),
+                    std::borrow::Cow::Owned(bytes.clone()),
+                )))
+            })
+            .expect("atlas insert")
+            .expect("atlas tile")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn text(tile: AtlasTile, x: f32, y: f32, mask: ContentMask<ScaledPixels>) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(x, y, 8.0, 16.0),
+            content_mask: mask,
+            color: gpui::hsla(0.0, 0.0, 0.9, 1.0),
+            tile,
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn triangle(x: f32, y: f32, size: f32, frame: Size<DevicePixels>) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(x), px(y)));
+        path.line_to(point(px(x + size), px(y)));
+        path.line_to(point(px(x + size / 2.0), px(y + size)));
+        path.color = gpui::hsla(0.1, 0.8, 0.5, 0.8).into();
+        path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: Size {
+                    width: px(frame.width.0 as f32),
+                    height: px(frame.height.0 as f32),
+                },
+            },
+        };
+        path.scale(1.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    struct TestFrame {
+        probe: u32,
+        cursor_x: f32,
+        shadow_hue: f32,
+        path_size: f32,
+        icon: bool,
+        rotated: bool,
+        radius: f32,
+        new_glyph: bool,
+        extra_layer: bool,
+        icon_seed: usize,
+    }
+
+    /// A small window-like scene: background, sidebar, a rounded bordered panel with a drop
+    /// shadow, text rows, a cursor, an underline, an icon, a path and optional extras.
+    #[cfg(target_os = "linux")]
+    fn test_scene(atlas: &dyn PlatformAtlas, size: Size<DevicePixels>, frame: &TestFrame) -> Scene {
+        let (width, height) = (size.width.0 as f32, size.height.0 as f32);
+        let mask = ContentMask {
+            bounds: scaled_bounds(0.0, 0.0, width, height),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(
+            0.0,
+            0.0,
+            width,
+            height,
+            gpui::hsla(0.6, 0.1, 0.08, 1.0),
+        ));
+        let mut sidebar = solid_quad(0.0, 0.0, 60.0, height, gpui::hsla(0.6, 0.1, 0.12, 1.0));
+        sidebar.border_widths.right = ScaledPixels(1.0);
+        sidebar.border_color = gpui::hsla(0.6, 0.1, 0.3, 1.0);
+        scene.insert_primitive(sidebar);
+        let panel_bounds = scaled_bounds(66.0, 10.0, width - 76.0, height - 20.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds: panel_bounds,
+            corner_radii: corners(frame.radius),
+            content_mask: mask,
+            color: gpui::hsla(frame.shadow_hue, 0.5, 0.3, 0.6),
+            element_bounds: panel_bounds,
+            element_corner_radii: corners(frame.radius),
+            inset: 0,
+            pad: 0,
+        });
+        scene.insert_primitive(panel(panel_bounds, mask, frame.radius));
+        let a = glyph_tile(atlas, 1);
+        let b = glyph_tile(atlas, 2);
+        for row in 0..8 {
+            for column in 0..20 {
+                let tile = if row == 3 && !frame.probe.is_multiple_of(2) {
+                    b
+                } else {
+                    a
+                };
+                let x = 72.0 + column as f32 * 9.0;
+                scene.insert_primitive(text(tile, x, 18.0 + row as f32 * 18.0, mask));
+            }
+        }
+        if frame.new_glyph {
+            scene.insert_primitive(text(glyph_tile(atlas, 3), 72.0, 168.0, mask));
+        }
+        scene.insert_primitive(solid_quad(
+            frame.cursor_x,
+            18.0 + 3.0 * 18.0,
+            8.0,
+            16.0,
+            gpui::hsla(0.3, 0.8, 0.6, 1.0),
+        ));
+        scene.insert_primitive(Underline {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(72.0, 18.0 + 5.0 * 18.0 + 15.0, 120.0, 2.0),
+            content_mask: mask,
+            color: gpui::hsla(0.0, 0.7, 0.6, 1.0),
+            thickness: ScaledPixels(1.0),
+            wavy: true.into(),
+        });
+        if frame.icon {
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds: scaled_bounds(20.0, 20.0, 16.0, 16.0),
+                content_mask: mask,
+                corner_radii: corners(3.0),
+                tile: icon_tile(atlas, frame.icon_seed),
+            });
+        }
+        scene.insert_primitive(triangle(230.0, 120.0, frame.path_size, size));
+        if frame.rotated {
+            let mut sprite = text(a, 250.0, 40.0, mask);
+            let (sin, cos) = 0.5f32.sin_cos();
+            sprite.transformation = TransformationMatrix {
+                rotation_scale: [[cos, -sin], [sin, cos]],
+                translation: [40.0, -100.0],
+            };
+            scene.insert_primitive(sprite);
+        }
+        if frame.extra_layer {
+            // Painted under everything after it, shifting their draw order numbers.
+            scene.insert_primitive(solid_quad(
+                4.0,
+                150.0,
+                30.0,
+                30.0,
+                gpui::hsla(0.9, 0.6, 0.5, 1.0),
+            ));
+        }
+        scene.finish();
+        scene
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_redraw_matches_full_redraw() -> anyhow::Result<()> {
+        let mut partial = WgpuHeadlessRenderer::new()?;
+        let mut full = WgpuHeadlessRenderer::new()?;
+        eprintln!(
+            "adapter: {} ({:?})",
+            partial.core.adapter_info.name, partial.core.adapter_info.backend
+        );
+        let base = TestFrame {
+            probe: 0,
+            cursor_x: 72.0,
+            shadow_hue: 0.6,
+            path_size: 40.0,
+            icon: true,
+            rotated: false,
+            radius: 8.0,
+            new_glyph: false,
+            extra_layer: false,
+            icon_seed: 1,
+        };
+        let frames = [
+            base,
+            base,
+            TestFrame { probe: 1, ..base },
+            TestFrame {
+                probe: 1,
+                cursor_x: 81.0,
+                ..base
+            },
+            TestFrame {
+                probe: 1,
+                cursor_x: 81.0,
+                shadow_hue: 0.1,
+                ..base
+            },
+            TestFrame {
+                probe: 2,
+                cursor_x: 81.0,
+                shadow_hue: 0.1,
+                path_size: 55.0,
+                ..base
+            },
+            TestFrame {
+                probe: 2,
+                path_size: 55.0,
+                icon: false,
+                ..base
+            },
+            TestFrame {
+                probe: 3,
+                path_size: 55.0,
+                icon: false,
+                rotated: true,
+                ..base
+            },
+            TestFrame {
+                probe: 3,
+                rotated: true,
+                new_glyph: true,
+                ..base
+            },
+            TestFrame {
+                probe: 3,
+                rotated: true,
+                new_glyph: true,
+                extra_layer: true,
+                ..base
+            },
+            TestFrame {
+                probe: 4,
+                rotated: true,
+                radius: 2.0,
+                ..base
+            },
+            TestFrame { probe: 5, ..base },
+            TestFrame { probe: 5, ..base },
+            // The icon's image is dropped from the atlas and another one takes its slot.
+            TestFrame {
+                probe: 5,
+                icon_seed: 4,
+                ..base
+            },
+        ];
+        let mut redrawn = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            if index == 13 {
+                for renderer in [&partial, &full] {
+                    renderer
+                        .sprite_atlas()
+                        .remove(&AtlasKey::Image(RenderImageParams {
+                            image_id: ImageId(1),
+                            frame_index: 0,
+                        }));
+                }
+            }
+            // One frame at another size: everything is redrawn, then partial resumes.
+            let size = if index == 6 {
+                device_size(320, 210)
+            } else {
+                device_size(300, 200)
+            };
+            let scene = test_scene(&*partial.sprite_atlas(), size, frame);
+            redrawn.push(partial.render_scene_retained(&scene, size)?);
+            let actual = partial.read_image()?;
+            let scene = test_scene(&*full.sprite_atlas(), size, frame);
+            let expected = full.render_scene_to_image(&scene, size)?;
+            assert_eq!(actual.dimensions(), expected.dimensions());
+            let differing = actual
+                .pixels()
+                .zip(expected.pixels())
+                .filter(|(actual, expected)| actual != expected)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "frame {index}: {differing} pixels differ from a full redraw (redrawn: {redrawn:?})"
+            );
+        }
+        let whole = 300 * 200;
+        assert_eq!(redrawn[0], whole, "the first frame is drawn in full");
+        assert_eq!(
+            redrawn[1], 0,
+            "an unchanged frame redraws nothing: {redrawn:?}"
+        );
+        assert!(redrawn[2] > 0 && redrawn[2] <= whole / 4, "{redrawn:?}");
+        assert!(redrawn[3] > 0 && redrawn[3] <= whole / 4, "{redrawn:?}");
+        // A glyph uploaded for the first time fills fresh atlas space: still partial (this
+        // frame also brings the icon back and resizes the path).
+        assert!(redrawn[8] > 0 && redrawn[8] < whole / 2, "{redrawn:?}");
+        assert!(redrawn[9] > 0 && redrawn[9] <= whole / 4, "{redrawn:?}");
+        assert_eq!(redrawn[12], 0, "{redrawn:?}");
+        // A removed tile's space may be reused with other pixels: everything is redrawn.
+        assert_eq!(redrawn[13], whole, "{redrawn:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn retained_frame_shaders_are_valid_wgsl() {
+        validate_wgsl(RETAINED_CLEAR_SHADER, naga::valid::Capabilities::empty());
+        validate_wgsl(RETAINED_BLIT_SHADER, naga::valid::Capabilities::empty());
+    }
+
+    /// A terminal-like 1280x857 window: background, sidebar with icons and labels, a rounded
+    /// bordered terminal panel with a drop shadow, 45 rows of 120 columns of text, a cursor
+    /// and a status bar. `probe` flips the glyphs of one row, like typing on one line.
+    #[cfg(target_os = "linux")]
+    fn terminal_scene(atlas: &dyn PlatformAtlas, size: Size<DevicePixels>, probe: u32) -> Scene {
+        let (width, height) = (size.width.0 as f32, size.height.0 as f32);
+        let mask = ContentMask {
+            bounds: scaled_bounds(0.0, 0.0, width, height),
+        };
+        let glyphs: Vec<AtlasTile> = (1..=6).map(|seed| glyph_tile(atlas, seed)).collect();
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(
+            0.0,
+            0.0,
+            width,
+            height,
+            gpui::hsla(0.6, 0.1, 0.08, 1.0),
+        ));
+        let mut sidebar = solid_quad(0.0, 0.0, 220.0, height, gpui::hsla(0.6, 0.1, 0.12, 1.0));
+        sidebar.border_widths.right = ScaledPixels(1.0);
+        sidebar.border_color = gpui::hsla(0.6, 0.1, 0.3, 1.0);
+        scene.insert_primitive(sidebar);
+        for item in 0..12 {
+            let y = 16.0 + item as f32 * 28.0;
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds: scaled_bounds(12.0, y, 16.0, 16.0),
+                content_mask: mask,
+                corner_radii: corners(3.0),
+                tile: icon_tile(atlas, item % 3),
+            });
+            for column in 0..18 {
+                let tile = glyphs[(item + column) % glyphs.len()];
+                scene.insert_primitive(text(tile, 36.0 + column as f32 * 9.0, y, mask));
+            }
+        }
+        let panel_bounds = scaled_bounds(228.0, 8.0, width - 236.0, height - 40.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(10.0),
+            bounds: panel_bounds,
+            corner_radii: corners(8.0),
+            content_mask: mask,
+            color: gpui::hsla(0.0, 0.0, 0.0, 0.5),
+            element_bounds: panel_bounds,
+            element_corner_radii: corners(8.0),
+            inset: 0,
+            pad: 0,
+        });
+        scene.insert_primitive(panel(panel_bounds, mask, 8.0));
+        for row in 0..45 {
+            for column in 0..115 {
+                let glyph = if row == 20 {
+                    (probe as usize) % 2
+                } else {
+                    (row * 7 + column * 3) % glyphs.len()
+                };
+                let x = 240.0 + column as f32 * 9.0;
+                scene.insert_primitive(text(glyphs[glyph], x, 16.0 + row as f32 * 17.6, mask));
+            }
+        }
+        scene.insert_primitive(solid_quad(
+            240.0 + 28.0 * 9.0,
+            16.0 + 20.0 * 17.6,
+            8.0,
+            16.0,
+            gpui::hsla(0.3, 0.8, 0.6, 1.0),
+        ));
+        let mut status = solid_quad(
+            0.0,
+            height - 28.0,
+            width,
+            28.0,
+            gpui::hsla(0.6, 0.1, 0.1, 1.0),
+        );
+        status.border_widths.top = ScaledPixels(1.0);
+        status.border_color = gpui::hsla(0.6, 0.1, 0.3, 1.0);
+        scene.insert_primitive(status);
+        scene.finish();
+        scene
+    }
+
+    /// `cargo test --release --features test-support --lib partial_redraw_benchmark -- --ignored --nocapture`
+    /// On a software adapter (lavapipe) this shows what partial redraw saves per frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "benchmark"]
+    fn partial_redraw_benchmark() -> anyhow::Result<()> {
+        let size = device_size(1280, 857);
+        let frames = 20;
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        eprintln!("adapter: {:?}", renderer.core.adapter_info);
+        let atlas = renderer.sprite_atlas();
+        let scenes: Vec<Scene> = (0..frames)
+            .map(|i| terminal_scene(&*atlas, size, i))
+            .collect();
+        eprintln!("scene: {}", scene_inventory(&scenes[0]).replace(' ', ", "));
+        // Warm up: shader compilation, atlas uploads, first retained frame.
+        renderer.render_scene(&scenes[0], size)?;
+        renderer.render_scene_retained(&scenes[0], size)?;
+        renderer.wait_for_gpu()?;
+
+        let time = |renderer: &mut WgpuHeadlessRenderer,
+                    draw: &dyn Fn(&mut WgpuHeadlessRenderer, &Scene) -> anyhow::Result<()>|
+         -> anyhow::Result<f64> {
+            let start = std::time::Instant::now();
+            for scene in &scenes {
+                draw(renderer, scene)?;
+                renderer.wait_for_gpu()?;
+            }
+            Ok(start.elapsed().as_secs_f64() * 1000.0 / frames as f64)
+        };
+        let full = time(&mut renderer, &|r, scene| r.render_scene(scene, size))?;
+        let partial = time(&mut renderer, &|r, scene| {
+            r.render_scene_retained(scene, size).map(|_| ())
+        })?;
+        let unchanged = time(&mut renderer, &|r, _| {
+            r.render_scene_retained(&scenes[0], size).map(|_| ())
+        })?;
+        eprintln!("full redraw:    {full:7.2} ms/frame");
+        eprintln!("partial redraw: {partial:7.2} ms/frame (one text row changes per frame)");
+        eprintln!(
+            "partial redraw: {unchanged:7.2} ms/frame (nothing changes: hashing and the copy out)"
+        );
+
+        // What each kind of primitive costs to rasterize over the whole window.
+        let mask = ContentMask {
+            bounds: scaled_bounds(0.0, 0.0, 1280.0, 857.0),
+        };
+        let single = |primitive: gpui::Primitive| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(primitive);
+            scene.finish();
+            scene
+        };
+        let whole = scaled_bounds(0.0, 0.0, 1280.0, 857.0);
+        let cases: Vec<(&str, Scene)> = vec![
+            (
+                "full-window plain quad",
+                single(solid_quad(0.0, 0.0, 1280.0, 857.0, gpui::red()).into()),
+            ),
+            (
+                "full-window rounded bordered quad",
+                single(panel(whole, mask, 8.0).into()),
+            ),
+            (
+                "full-window drop shadow",
+                single(
+                    Shadow {
+                        order: 0,
+                        blur_radius: ScaledPixels(10.0),
+                        bounds: scaled_bounds(30.0, 30.0, 1220.0, 797.0),
+                        corner_radii: corners(8.0),
+                        content_mask: mask,
+                        color: gpui::hsla(0.0, 0.0, 0.0, 0.5),
+                        element_bounds: scaled_bounds(30.0, 30.0, 1220.0, 797.0),
+                        element_corner_radii: corners(8.0),
+                        inset: 0,
+                        pad: 0,
+                    }
+                    .into(),
+                ),
+            ),
+            ("empty frame (clear only)", Scene::default()),
+        ];
+        for (name, scene) in &cases {
+            renderer.render_scene(scene, size)?;
+            renderer.wait_for_gpu()?;
+            let start = std::time::Instant::now();
+            for _ in 0..frames {
+                renderer.render_scene(scene, size)?;
+                renderer.wait_for_gpu()?;
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            eprintln!("{name:34} {ms:7.2} ms/frame");
+        }
+        Ok(())
     }
 }
