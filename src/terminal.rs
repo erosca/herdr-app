@@ -1021,9 +1021,20 @@ fn cell_font(bold: bool, italic: bool) -> Font {
     let mut f = font(crate::settings::terminal_font());
     // Ligatures merge several cells into one glyph, which breaks the grid.
     f.features = FontFeatures(std::sync::Arc::new(vec![("calt".into(), 0), ("liga".into(), 0), ("dlig".into(), 0)]));
-    f.weight = if bold { FontWeight::BOLD } else { FontWeight::MEDIUM };
+    let regular = if vte_compat() { FontWeight::NORMAL } else { FontWeight::MEDIUM };
+    f.weight = if bold { FontWeight::BOLD } else { regular };
     f.style = if italic { FontStyle::Italic } else { FontStyle::Normal };
     f
+}
+
+/// `HERDR_VTE_COMPAT=1` (read once): terminal text measured and placed as VTE
+/// terminals (GNOME Terminal, Tilix) do, so the same font and pixel size look
+/// the same: cells of whole pixels, rows of the font's own height without extra
+/// spacing, and regular text at the regular weight. GPUI reads the same switch
+/// to put every glyph exactly on its cell.
+fn vte_compat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HERDR_VTE_COMPAT").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0"))
 }
 
 pub fn cell_size(window: &Window) -> Size<Pixels> {
@@ -1032,11 +1043,19 @@ pub fn cell_size(window: &Window) -> Size<Pixels> {
     let id = ts.resolve_font(&f);
     let fs = px(crate::settings::font_size());
     let w = ts.advance(id, fs, 'M').map(|s| s.width).unwrap_or(fs * 0.6);
+    let scale = window.scale_factor();
+    if vte_compat() {
+        // VTE rounds the advance to whole pixels and stacks the rounded-up ascent
+        // and descent.
+        let device = |v: Pixels| f32::from(v) * scale;
+        let w = device(w).round().max(1.0);
+        let h = device(ts.ascent(id, fs)).ceil() + device(ts.descent(id, fs)).abs().ceil();
+        return size(px(w / scale), px(h.max(1.0) / scale));
+    }
     let h = ts.ascent(id, fs) + ts.descent(id, fs).abs();
     // The width stays the font's own advance: GPUI only moves a glyph onto the
     // grid once it drifts over 1px, so a rounded width made text wobble.
     // Boxes snap their edges instead (`snap_box`).
-    let scale = window.scale_factor();
     size(w, px((f32::from(h) * 1.15 * scale).ceil() / scale))
 }
 
