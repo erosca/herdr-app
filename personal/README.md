@@ -18,8 +18,8 @@ personal/setup.sh --nomachine  # a NoMachine desktop (software rendering)
 It builds the app (Rust 1.95+, Zig 0.16, downloaded to `~/.local/opt` if
 missing), installs herdr-core if there's none, points `~/.local/bin/herdr-app`
 and the Herdr menu entry at this build, and merges the files below into
-`~/.config/herdr-app`. Re-run it after pulling to rebuild; changed settings
-files are backed up first. Then quit Herdr and open it again.
+`~/.config/herdr-app` (and `~/.inputrc`). Re-run it after pulling to rebuild;
+changed settings files are backed up first. Then quit Herdr and open it again.
 
 A server you only reach through Herdr's SSH machines needs nothing from here:
 just herdr-core, which Herdr sets up when you add the machine.
@@ -32,6 +32,7 @@ just herdr-core, which Herdr sets up when you add the machine.
 | `settings.json` | merged into `settings.json` | font, size, zoom, theme |
 | `themes/*.json` | copied to `themes/` | e.g. `tilix.json` |
 | `fonts/*` | copied to `fonts/` | for machines that lack the font |
+| `inputrc` | added to `~/.inputrc` (bash), when missing | Shift+Enter runs the command line instead of printing `;2;13~` |
 | `herdr-app.in` | `~/.local/bin/herdr-app-personal`, which `herdr-app` points at | `ZED_FONTS_GAMMA=1.0` and `HERDR_VTE_COMPAT=1` everywhere; with `--nomachine` also GL, `HERDR_RENDER_PARTIAL=cpu` and the `WAYLAND_DISPLAY=no` fix |
 
 ## Saving changes from a machine

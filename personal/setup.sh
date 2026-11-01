@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sets up Herdr on this machine from this fork: builds the patched app, points the
 # launcher at it, and merges the personal settings in personal/ (keys, look,
-# themes, fonts). Linux only. Safe to re-run: changed files are backed up first.
+# themes, fonts, the shell's keys in inputrc). Linux only. Safe to re-run:
+# changed files are backed up first.
 #
 #   personal/setup.sh                 build, launcher, settings
 #   personal/setup.sh --nomachine     the same, plus the NoMachine lines in the
@@ -10,7 +11,7 @@
 #   options:
 #     --no-build      use the existing target/release/herdr-app
 #     --no-core       don't install herdr-core when it's missing
-#     --config-only   only merge keys, settings, themes and fonts
+#     --config-only   only merge keys, settings, themes, fonts and inputrc
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +23,7 @@ for arg in "$@"; do
     --no-build) build=false ;;
     --no-core) core=false ;;
     --config-only) build=false core=false launcher=false ;;
-    -h | --help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown option $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -135,6 +136,29 @@ if [[ -n $font ]] && command -v fc-list >/dev/null && [[ -z $(fc-list "$font" fa
   echo "warning: font \"$font\" isn't installed here; Herdr falls back to JetBrains Mono."
   echo "         On a machine that has it: personal/capture.sh --fonts, then commit personal/fonts."
 fi
+
+# Bash reads its keys from ~/.inputrc (or $INPUTRC): add the bindings it lacks.
+inputrc=${INPUTRC:-$HOME/.inputrc}
+say "Shell keys in $inputrc"
+missing=$(grep '^"' "$here/inputrc" | while IFS= read -r line; do
+  grep -qxF -- "$line" "$inputrc" 2>/dev/null || printf '%s\n' "$line"
+done)
+if [[ -z $missing ]]; then
+  echo "  unchanged: $inputrc"
+else
+  if [[ -f $inputrc ]]; then
+    backup="$inputrc.bak-$(date +%Y%m%d-%H%M%S)"
+    cp "$inputrc" "$backup"
+    echo "  backup:    $backup"
+  elif [[ -f /etc/inputrc ]]; then
+    # A new ~/.inputrc replaces the system's, so it keeps those bindings (Home, End, ...).
+    echo '$include /etc/inputrc' >"$inputrc"
+  fi
+  { echo; grep '^#' "$here/inputrc"; printf '%s\n' "$missing"; } >>"$inputrc"
+  echo "  wrote:     $inputrc"
+  echo "Shells already open (Herdr keeps them across restarts) need: bind -f $inputrc"
+fi
+[[ ${SHELL##*/} == zsh ]] && echo "note: your shell is zsh; add to ~/.zshrc: bindkey '^[[27;2;13~' accept-line"
 
 say "Done"
 echo "Quit Herdr completely and open it again to use the new build and settings."
