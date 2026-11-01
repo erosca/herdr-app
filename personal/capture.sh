@@ -8,7 +8,8 @@
 #   options:
 #     --fonts    also copy the configured terminal font's files (for machines
 #                that lack it, such as Ubuntu Mono outside Ubuntu)
-#     --tilix    also write themes/tilix.json from this machine's Tilix profile
+#     --tilix    also write themes/tilix.json from this machine's Tilix profile,
+#                and take Tilix's font: the same family at the same pixel size
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -37,7 +38,7 @@ for theme in "$config"/themes/*.json; do
   [[ -e $repo/defaults/themes/$(basename "$theme") ]] && continue
   cp -v "$theme" "$here/themes/"
 done
-$tilix && python3 -I "$here/tools/tilix_theme.py" "$here/themes/tilix.json"
+$tilix && python3 -I "$here/tools/tilix_theme.py" "$here/themes/tilix.json" "$here/settings.json"
 
 if $fonts; then
   mkdir -p "$here/fonts"
