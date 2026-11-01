@@ -4,8 +4,9 @@
 # themes, fonts). Linux only. Safe to re-run: changed files are backed up first.
 #
 #   personal/setup.sh                 build, launcher, settings
-#   personal/setup.sh --nomachine     the same, launched through the NoMachine
-#                                     wrapper (partial redraw, GL, font gamma)
+#   personal/setup.sh --nomachine     the same, plus the NoMachine lines in the
+#                                     launcher (software rendering: GL, partial
+#                                     redraw; WAYLAND_DISPLAY=no unset)
 #   options:
 #     --no-build      use the existing target/release/herdr-app
 #     --no-core       don't install herdr-core when it's missing
@@ -90,15 +91,18 @@ if $launcher; then
   say "Launcher"
   [[ -x $app ]] || echo "warning: $app isn't built yet (run without --no-build)"
   mkdir -p "$bin" "$data/applications" "$data/icons/hicolor/scalable/apps"
-  if $nomachine; then
-    sed "s|@REPO@|$repo|g" "$here/herdr-app-nx.in" >"$bin/herdr-app-nx"
-    chmod +x "$bin/herdr-app-nx"
-    ln -sfn "$bin/herdr-app-nx" "$bin/herdr-app"
-    echo "herdr-app -> herdr-app-nx (NoMachine wrapper) -> $app"
-  else
-    ln -sfn "$app" "$bin/herdr-app"
-    echo "herdr-app -> $app"
+  # The launcher sets the render settings on every machine; --nomachine keeps its
+  # #NOMACHINE lines, other machines drop them.
+  if $nomachine; then keep='s/^#NOMACHINE //'; else keep='/^#NOMACHINE /d'; fi
+  sed -e "s|@REPO@|$repo|g" -e "$keep" "$here/herdr-app.in" >"$bin/herdr-app-personal"
+  chmod +x "$bin/herdr-app-personal"
+  ln -sfn "$bin/herdr-app-personal" "$bin/herdr-app"
+  # The earlier NoMachine-only launcher, if one of these scripts (or the hand-made
+  # first version) wrote it.
+  if [[ -f $bin/herdr-app-nx ]] && grep -q 'Herdr source build tuned for' "$bin/herdr-app-nx"; then
+    rm "$bin/herdr-app-nx"
   fi
+  echo "herdr-app -> herdr-app-personal$($nomachine && echo ' (with the NoMachine lines)') -> $app"
   cp "$repo/assets/icons/herdr-ui-icon-clean.svg" "$data/icons/hicolor/scalable/apps/herdr-app.svg"
   cat >"$data/applications/herdr-app.desktop" <<EOF
 [Desktop Entry]

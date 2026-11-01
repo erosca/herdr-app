@@ -31,7 +31,7 @@ just herdr-core, which Herdr sets up when you add the machine.
 | `settings.json` | merged into `settings.json` | font, size, zoom, theme |
 | `themes/*.json` | copied to `themes/` | e.g. `tilix.json` |
 | `fonts/*` | copied to `fonts/` | for machines that lack the font |
-| `herdr-app-nx.in` | `~/.local/bin/herdr-app-nx` (`--nomachine`) | `HERDR_RENDER_PARTIAL=cpu`, GL, `ZED_FONTS_GAMMA=1.0` |
+| `herdr-app.in` | `~/.local/bin/herdr-app-personal`, which `herdr-app` points at | `ZED_FONTS_GAMMA=1.0` everywhere; with `--nomachine` also GL, `HERDR_RENDER_PARTIAL=cpu` and the `WAYLAND_DISPLAY=no` fix |
 
 ## Saving changes from a machine
 
