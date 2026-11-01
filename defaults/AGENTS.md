@@ -544,6 +544,9 @@ The main ones:
   Windows, clipboard text is pasted; otherwise Ctrl+V goes to the program, which
   reads the clipboard itself). TIFF and BMP clipboard
   images are converted to PNG before sending,
+  `terminal.scroll {by}` (the focused terminal's history: `page_up`, `page_down`,
+  `bottom` or a number of lines, negative up; Shift+PageUp/PageDown; a full-screen
+  program gets PageUp/PageDown or arrows instead),
   `terminal.right_click {to: "program" | "menu", terminal?}` (where right-clicks go
   when the program takes the mouse; kept as its label `herdr.right-click=program`;
   Shift+right-click is always Herdr's menu). Copy, paste, paste-image and implicit

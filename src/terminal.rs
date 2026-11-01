@@ -526,6 +526,36 @@ impl TerminalView {
         true
     }
 
+    /// Scrolls the history (Shift+PageUp/PageDown), or back to the bottom. A full-screen
+    /// program has no history here, so it gets PageUp/PageDown or arrow keys instead, as the
+    /// wheel sends it arrows: pagers and editors page with them.
+    pub fn scroll_by(&mut self, by: Scroll, cx: &mut Context<Self>) {
+        let mut g = self.grid.borrow_mut();
+        if g.vt.alt_screen() {
+            let (key, n) = match by {
+                Scroll::Pages(n) if n < 0 => (GHOSTTY_KEY_PAGE_UP, n.unsigned_abs()),
+                Scroll::Pages(n) => (GHOSTTY_KEY_PAGE_DOWN, n.unsigned_abs()),
+                Scroll::Lines(n) if n < 0 => (GHOSTTY_KEY_ARROW_UP, n.unsigned_abs()),
+                Scroll::Lines(n) => (GHOSTTY_KEY_ARROW_DOWN, n.unsigned_abs()),
+                Scroll::Bottom => return,
+            };
+            let mut bytes = Vec::new();
+            for _ in 0..n.min(Scroll::MAX_KEYS) {
+                bytes.extend(g.vt.encode_key(key, 0, 0, None, None));
+            }
+            drop(g);
+            self.send(&bytes);
+        } else {
+            let rows = isize::from(g.vt.rows.max(1));
+            match by {
+                Scroll::Pages(n) => g.vt.scroll_viewport(n * rows),
+                Scroll::Lines(n) => g.vt.scroll_viewport(n),
+                Scroll::Bottom => g.vt.scroll_to_bottom(),
+            }
+        }
+        cx.notify();
+    }
+
     /// Copies the selection to the clipboard (and the primary selection on Linux).
     pub fn copy(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.grid.borrow().vt.selection_text() {
@@ -1514,8 +1544,55 @@ impl Focusable for TerminalView {
     }
 }
 
+/// How far `terminal.scroll` moves: pages or lines (negative: up into the history), or back
+/// to the bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    Pages(isize),
+    Lines(isize),
+    Bottom,
+}
+
+impl Scroll {
+    /// Caps a line count, so a typo like `99999999` stays harmless.
+    const MAX_LINES: isize = 100_000;
+    /// At most this many keys go to a full-screen program for one scroll.
+    const MAX_KEYS: usize = 1_000;
+
+    /// `page_up`, `page_down`, `bottom` or a number of lines, as keys.json and
+    /// `herdr-app do` give it.
+    pub fn parse(by: &serde_json::Value) -> Option<Self> {
+        let lines = |n: i64| (n != 0).then(|| Scroll::Lines(n.clamp(-Self::MAX_LINES as i64, Self::MAX_LINES as i64) as isize));
+        match by {
+            serde_json::Value::String(s) => match s.trim() {
+                "page_up" => Some(Scroll::Pages(-1)),
+                "page_down" => Some(Scroll::Pages(1)),
+                "bottom" => Some(Scroll::Bottom),
+                n => n.parse::<i64>().ok().and_then(lines),
+            },
+            serde_json::Value::Number(n) => n.as_i64().and_then(lines),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_amounts_parse_from_keys_and_commands() {
+        use super::Scroll;
+        use serde_json::json;
+        assert_eq!(Scroll::parse(&json!("page_up")), Some(Scroll::Pages(-1)));
+        assert_eq!(Scroll::parse(&json!("page_down")), Some(Scroll::Pages(1)));
+        assert_eq!(Scroll::parse(&json!("bottom")), Some(Scroll::Bottom));
+        assert_eq!(Scroll::parse(&json!("-3")), Some(Scroll::Lines(-3)));
+        assert_eq!(Scroll::parse(&json!(5)), Some(Scroll::Lines(5)));
+        assert_eq!(Scroll::parse(&json!("-99999999999")), Some(Scroll::Lines(-100_000)));
+        for nothing in [json!("0"), json!(0), json!("up"), json!(""), json!(true), json!(null)] {
+            assert_eq!(Scroll::parse(&nothing), None, "{nothing}");
+        }
+    }
+
     #[test]
     fn mouse_buttons_only_follow_the_pane_that_took_each_press() {
         use super::*;
