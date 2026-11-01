@@ -1,0 +1,7 @@
+#!/bin/sh
+# Herdr source build tuned for a NoMachine desktop (software rendering).
+# Written by personal/setup.sh --nomachine; edit personal/herdr-app-nx.in instead.
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
+export HERDR_RENDER_PARTIAL=cpu HERDR_TEST_GPU_BACKEND=gl
+export ZED_FONTS_GAMMA=1.0
+exec "@REPO@/target/release/herdr-app" "$@"
