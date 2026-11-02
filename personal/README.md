@@ -33,6 +33,9 @@ just herdr-core, which Herdr sets up when you add the machine.
 | `themes/*.json` | copied to `themes/` | e.g. `tilix.json` |
 | `fonts/*` | copied to `fonts/` | for machines that lack the font |
 | `inputrc` | added to `~/.inputrc` (bash), when missing | Shift+Enter runs the command line instead of printing `;2;13~` |
+| `bin/*` | `~/.local/bin/` | agents' programs, e.g. `dummy-agent` |
+| `hc-templates/*.md` | `~/.config/herdr-core/templates/` | agents `hc run` starts by name |
+| `programs.json` | merged into `programs.json` | agents' names and tiles in Herdr, and its menu of agents to start |
 | `herdr-app.in` | `~/.local/bin/herdr-app-personal`, which `herdr-app` points at | `ZED_FONTS_GAMMA=1.0` and `HERDR_VTE_COMPAT=1` everywhere; with `--nomachine` also GL, `HERDR_RENDER_PARTIAL=cpu` and the `WAYLAND_DISPLAY=no` fix |
 
 ## Saving changes from a machine
@@ -55,3 +58,28 @@ from Tilix), characters and rows land on the same pixels as in Tilix. The
 glyph shapes can still differ by a shade per pixel: Tilix draws them with
 FreeType, Herdr with its own rasterizer. To compare unhinted glyphs, start
 Herdr with `HERDR_FONT_HINTING=0`.
+
+## Dummy agent
+
+`dummy-agent` is the smallest agent, to try Herdr's agent features with: every
+question takes 10 seconds (`DUMMY_AGENT_DELAY`), then the answer is `done`. It
+reports its state through OSC 7501, so Herdr treats it like Claude or Codex:
+
+- **Start it** from Herdr's new-agent menu (**Dummy agent**), or run
+  `dummy-agent` in a terminal pane. Type a question and press Enter.
+- **Watch it:** the sidebar and tab show it working, then done.
+- **Notifications:** switch to another tab while it works. When it answers,
+  Herdr plays the "done" sound and posts a "dummy finished" toast; click it to
+  go back. While you look at it, there is no toast.
+- **From a shell or another agent** (`hc`, herdr-core's command):
+
+  ```sh
+  hc run --bg --name d dummy "Is it done?"   # starts it, sends the question
+  hc wait d                                  # returns once it answered
+  hc read d --lines 5                        # its screen: the answer
+  hc send d "Another one"; hc wait d
+  hc kill d
+  ```
+
+  An agent that starts it this way becomes its parent and gets its news.
+- **Stop an answer** with Ctrl+C (or `hc interrupt d`); Ctrl+D quits.

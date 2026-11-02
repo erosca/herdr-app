@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Sets up Herdr on this machine from this fork: builds the patched app, points the
 # launcher at it, and merges the personal settings in personal/ (keys, look,
-# themes, fonts, the shell's keys in inputrc). Linux only. Safe to re-run:
-# changed files are backed up first.
+# themes, fonts, the shell's keys in inputrc) and installs the personal agents
+# (bin/, hc-templates/, programs.json). Linux only. Safe to re-run: changed
+# files are backed up first.
 #
 #   personal/setup.sh                 build, launcher, settings
 #   personal/setup.sh --nomachine     the same, plus the NoMachine lines in the
@@ -11,7 +12,7 @@
 #   options:
 #     --no-build      use the existing target/release/herdr-app
 #     --no-core       don't install herdr-core when it's missing
-#     --config-only   only merge keys, settings, themes, fonts and inputrc
+#     --config-only   only the settings and agents (no build, core or launcher)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +24,7 @@ for arg in "$@"; do
     --no-build) build=false ;;
     --no-core) core=false ;;
     --config-only) build=false core=false launcher=false ;;
-    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown option $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -136,6 +137,37 @@ if [[ -n $font ]] && command -v fc-list >/dev/null && [[ -z $(fc-list "$font" fa
   echo "warning: font \"$font\" isn't installed here; Herdr falls back to JetBrains Mono."
   echo "         On a machine that has it: personal/capture.sh --fonts, then commit personal/fonts."
 fi
+
+# Agents: their programs on PATH, their herdr-core templates (`hc run NAME`), and
+# their programs.json entries (Herdr's name and tile, and its menu of agents).
+say "Agents"
+templates=${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core/templates
+for file in "$here"/bin/*; do
+  [[ -f $file ]] || continue
+  mkdir -p "$bin"
+  install -m 755 "$file" "$bin/$(basename "$file")"   # edit them in personal/bin
+  echo "  wrote:     $bin/$(basename "$file")"
+done
+for file in "$here"/hc-templates/*.md; do
+  [[ -f $file ]] || continue
+  target="$templates/$(basename "$file")"
+  if [[ -f $target ]] && cmp -s "$file" "$target"; then
+    echo "  unchanged: $target"
+    continue
+  fi
+  if [[ -f $target ]]; then
+    backup="$target.bak-$(date +%Y%m%d-%H%M%S)"
+    cp "$target" "$backup"
+    echo "  backup:    $backup"
+  fi
+  mkdir -p "$templates"
+  cp "$file" "$target"
+  echo "  wrote:     $target"
+done
+if [[ -f $here/programs.json ]]; then
+  json merge-programs "$here/programs.json" "$config/programs.json"
+fi
+case ":$PATH:" in *":$bin:"*) ;; *) echo "note: the agents need $bin on PATH" ;; esac
 
 # Bash reads its keys from ~/.inputrc (or $INPUTRC): add the bindings it lacks.
 inputrc=${INPUTRC:-$HOME/.inputrc}

@@ -8,6 +8,9 @@
   herdr_json.py merge-settings <personal> <target> <themes-dir>
       Sets the personal settings.json values in the target. A "theme" is only
       set when its file is in themes-dir (or is a built-in theme).
+  herdr_json.py merge-programs <personal> <target>
+      Adds the personal programs.json entries to the target, entry by entry
+      (a personal field wins), and its shells and interpreters.
   herdr_json.py capture-keys <current> <defaults> <out>
       Updates out with the bindings in current that differ from Herdr's
       defaults. Bindings out already lists stay (with current's value), so
@@ -70,6 +73,18 @@ def merge_settings(personal, target, themes_dir):
     save(target, settings)
 
 
+def merge_programs(personal, target):
+    table = load(target, {})
+    mine = load(personal, {})
+    for key, entry in mine.get("programs", {}).items():
+        programs = table.setdefault("programs", {})
+        programs[key] = {**programs.get(key, {}), **entry}
+    for key in ("shells", "interpreters"):
+        if mine.get(key):
+            table[key] = table.get(key, []) + [n for n in mine[key] if n not in table.get(key, [])]
+    save(target, table)
+
+
 def capture_keys(current, defaults, out):
     keys, base = load(current, {}), load(defaults, {})
     personal = load(out, {})
@@ -93,6 +108,7 @@ if __name__ == "__main__":
     commands = {
         "merge-keys": merge_keys,
         "merge-settings": merge_settings,
+        "merge-programs": merge_programs,
         "capture-keys": capture_keys,
         "capture-settings": capture_settings,
     }
