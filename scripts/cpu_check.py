@@ -2,7 +2,7 @@
 """Tests, one setup at a time, why herdr-app uses so much CPU on this machine,
 and prints a short report to paste back.
 
-    scripts/cpu_check.py [--seconds 12] [--only gpu,cap20] [--bin PATH]
+    scripts/cpu_check.py [--seconds 12] [--only gpu,launcher] [--bin PATH]
 
 Run it in the desktop session where Herdr is slow (e.g. NoMachine), with no
 build running. It opens a test window several times, one per setup below, each
@@ -23,20 +23,17 @@ and it measures herdr-app's CPU, the part of it in the software rasterizer's
 llvmpipe threads, the window's draws per second, the CPU each draw costs and
 how much of the main thread's share goes to building the frame. With Linux perf
 allowed (kernel.perf_event_paranoid 2 or lower), it also samples the main
-thread while the GPU setup scrolls: which functions that time goes to.
+thread while the launcher setup scrolls: which functions that time goes to.
 
 Setups run by default (each opens a fresh test window):
 
-  gpu          no backend forced (NVIDIA Vulkan here), Fifo present, no draw cap
-  gpu-imm      gpu, Immediate present (no wait for the display's refresh)
-  gpu-mailbox  gpu, Mailbox present
-  gpu-yield    gpu, NVIDIA's driver told to sleep rather than spin while it waits
-               (__GL_YIELD=USLEEP)
-  cap30 .. cap10  gpu, draws capped at 30, 20 (the NoMachine launcher), 15 and 10
-               a second (HERDR_MAX_FPS)
+  gpu          no backend forced (NVIDIA Vulkan here), Fifo present, no draw cap:
+               the reference
+  launcher     what the NoMachine launcher sets (read from personal/herdr-app.in)
 
-Earlier rounds' setups (--only to run them): gl (OpenGL on llvmpipe), gpu-30,
-gpu-20, now, nopartial, lp4, quarter, auto, vgl and nxvgl.
+Earlier rounds' setups (--only to run them): gpu-imm, gpu-mailbox, gpu-yield
+(__GL_YIELD=USLEEP), cap30, cap20, cap15, cap10 (HERDR_MAX_FPS), gl (OpenGL on
+llvmpipe), gpu-30, gpu-20, now, nopartial, lp4, quarter, auto, vgl, nxvgl.
 
 The report holds numbers, GPU adapter names, the screen size and the CPU count:
 no paths, user or host names, terminal contents or environment. Everything
@@ -88,15 +85,17 @@ time.sleep(10 ** 7)
 
 NOW = {"HERDR_TEST_GPU_BACKEND": "gl", "HERDR_RENDER_PARTIAL": "cpu"}
 GPU = {"HERDR_RENDER_PARTIAL": "cpu"}
-DEFAULT = ["gpu", "gpu-imm", "gpu-mailbox", "gpu-yield", "cap30", "cap20", "cap15", "cap10"]
+DEFAULT = ["gpu", "launcher"]
 FIFO = dict(GPU, HERDR_TEST_PRESENT_MODE="fifo")  # Fifo is the default; naming it logs the modes there are
 # The setup and scenario whose main thread perf samples.
-PERF_AT = ("gpu", "scroll")
+PERF_AT = ("launcher", "scroll")
 # name, what it is, environment, wrapper, window, scenarios
 SETUPS = [
     ("gl", "OpenGL on llvmpipe, partial redraw (the old NoMachine launcher)", NOW, None, "max", ["scroll"]),
     ("gpu", "no backend forced, Fifo present, draws not capped", FIFO, None, "max",
      ["idle", "scroll", "status", "hidden"]),
+    # Its environment comes from personal/herdr-app.in when the run starts.
+    ("launcher", "the NoMachine launcher's settings", None, None, "max", ["idle", "scroll", "status", "hidden"]),
     ("gpu-imm", "gpu, Immediate present", dict(GPU, HERDR_TEST_PRESENT_MODE="immediate"), None, "max",
      ["scroll", "status"]),
     ("gpu-mailbox", "gpu, Mailbox present", dict(GPU, HERDR_TEST_PRESENT_MODE="mailbox"), None, "max", ["scroll"]),
@@ -137,6 +136,24 @@ def read(path):
             return f.read().decode("utf-8", "replace")
     except OSError:
         return None
+
+
+def launcher_env():
+    """What the NoMachine launcher exports (its #NOMACHINE lines and the shared ones)."""
+    text = read(os.path.join(HERE, "..", "personal", "herdr-app.in"))
+    if text is None:
+        return None
+    env = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#NOMACHINE "):
+            line = line[len("#NOMACHINE "):].strip()
+        if line.startswith("export "):
+            for word in line[len("export "):].split():
+                k, eq, v = word.partition("=")
+                if eq and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                    env[k] = v.strip("'\"")
+    return env
 
 
 def environ_of(pid):
@@ -641,6 +658,8 @@ def report(ctx, runs, skipped):
       f"NoMachine VirtualGL: {'present' if ctx.nxvgl else 'none'}")
     w(f"draw cap (HERDR_MAX_FPS) in this binary: {'yes' if ctx.has_cap else 'no (build the branch with it to test gpu-30/gpu-20)'}; "
       f"perf: {ctx.perf_note}")
+    if ctx.launcher:
+        w("launcher settings: " + ", ".join(f"{k}={ctx.clean(v)}" for k, v in ctx.launcher.items()))
     if ctx.preload_dropped:
         w("note: a VirtualGL/NoMachine LD_PRELOAD in this shell was left out of the test windows")
     adapters = []
@@ -715,6 +734,17 @@ def report(ctx, runs, skipped):
 
     w("Hypotheses (only those this run tested)")
     g = row("gpu", "scroll")
+    for tag, scenario, what in (("T1", "scroll", "a scrolling build"), ("T2", "status", "a status line updating 20 times a second")):
+        base, mine = row("gpu", scenario), row("launcher", scenario)
+        if base and mine:
+            verdict(tag, mine["app"] <= 0.5 * base["app"],
+                    f"the launcher's settings cut the CPU of {what}: {mine['app']:.1f}% at {mine['draws']:.0f} draws/s,"
+                    f" from {base['app']:.1f}% at {base['draws']:.0f}/s")
+    li, lh = row("launcher", "idle"), row("launcher", "hidden")
+    if li and lh:
+        verdict("T3", li["app"] < 2 and lh["app"] < 3,
+                f"with the launcher's settings, nothing changing on screen costs ~nothing: idle {li['app']:.1f}%,"
+                f" output in a hidden tab {lh['app']:.1f}%")
     if g and any(r.name.startswith("cap") or r.name in ("gpu-imm", "gpu-mailbox", "gpu-yield") for r in runs):
         verdict("S1", g["draws"] <= 33,
                 f"one printing terminal draws at most ~30 times a second (the output clock fix): {g['draws']:.0f} draws/s")
@@ -890,9 +920,16 @@ def main():
 
     wanted = set(args.only.split(",")) if args.only else set(DEFAULT)
     setups, skipped = [], []
+    ctx.launcher = None
     for s in SETUPS:
         if wanted and s[0] not in wanted:
             continue
+        if s[0] == "launcher":
+            ctx.launcher = launcher_env()
+            if ctx.launcher is None:
+                skipped.append((s[0], "personal/herdr-app.in not found next to this script"))
+                continue
+            s = (s[0], s[1], ctx.launcher) + tuple(s[3:])
         if s[3] == "vgl" and not ctx.vgl:
             skipped.append((s[0], "VirtualGL not installed (3.1 or later: github.com/VirtualGL/virtualgl/releases)"))
         elif s[3] == "vgl" and ctx.nvidia and not ctx.nvidia_ok:
