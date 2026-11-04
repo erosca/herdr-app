@@ -151,6 +151,19 @@ enum FrameRateLimit {
     Thermal,
 }
 
+/// HERDR: `HERDR_MAX_FPS=<n>` caps how often a window draws, whatever asked for the
+/// frame (a terminal printing, a mod re-rendering): what changes in between is drawn
+/// together in the next allowed frame, at most one interval late (33 ms at 30).
+/// Forced renders and presentation-only frames aren't held back. Unset, 0 or not a
+/// number: no cap. Read once.
+fn herdr_max_fps_interval() -> Option<Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let fps: f64 = std::env::var("HERDR_MAX_FPS").ok()?.trim().parse().ok()?;
+        (fps.is_finite() && fps > 0.0).then(|| Duration::from_secs_f64(1.0 / fps))
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct WindowInvalidator {
     inner: Rc<RefCell<WindowInvalidatorInner>>,
@@ -1603,6 +1616,8 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        // HERDR: when this window last drew, for HERDR_MAX_FPS.
+        let last_draw_time: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1757,6 +1772,25 @@ impl Window {
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
+                // HERDR: HERDR_MAX_FPS holds a draw back until its interval has passed since
+                // the last one; the window stays invalidated, so a later request draws it
+                // (on X11 the next tick of the refresh timer).
+                if !force_render
+                    && !request_frame_options.require_presentation
+                    && invalidator.is_dirty()
+                    && let Some(interval) = herdr_max_fps_interval()
+                    && let Some(last_draw) = last_draw_time.get()
+                    && Instant::now().duration_since(last_draw) < interval
+                {
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window.platform_window.schedule_frame();
+                        })
+                        .log_err();
+                    invalidator.wake_platform();
+                    return;
+                }
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1834,6 +1868,7 @@ impl Window {
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 if should_draw {
+                    last_draw_time.set(Some(Instant::now()));
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
