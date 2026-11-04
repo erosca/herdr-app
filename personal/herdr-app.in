@@ -9,8 +9,9 @@ export ZED_FONTS_GAMMA=1.0 HERDR_VTE_COMPAT=1
 #NOMACHINE # WAYLAND_DISPLAY=no. No backend is forced: NVIDIA's Vulkan draws into
 #NOMACHINE # NoMachine's display (scripts/cpu_check.py: 58% CPU scrolling, against 976%
 #NOMACHINE # with GL on llvmpipe). Partial redraw only acts if it falls back to llvmpipe.
-#NOMACHINE # Scrolling output then drew ~60 times a second, ~10 ms of CPU each; NoMachine
-#NOMACHINE # streams the screen at about 30 frames a second, so draws are capped there.
+#NOMACHINE # Each draw still costs ~9 ms of CPU (NVIDIA copies every frame into NoMachine's
+#NOMACHINE # display), so output draws at most 20 times a second; within 250 ms of a key,
+#NOMACHINE # click or scroll every frame draws at once.
 #NOMACHINE unset WAYLAND_DISPLAY WAYLAND_SOCKET
-#NOMACHINE export HERDR_RENDER_PARTIAL=cpu HERDR_MAX_FPS=30
+#NOMACHINE export HERDR_RENDER_PARTIAL=cpu HERDR_MAX_FPS=20
 exec "@REPO@/target/release/herdr-app" "$@"
