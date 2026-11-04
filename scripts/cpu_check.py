@@ -2,7 +2,7 @@
 """Tests, one setup at a time, why herdr-app uses so much CPU on this machine,
 and prints a short report to paste back.
 
-    scripts/cpu_check.py [--seconds 12] [--only now,vgl] [--bin PATH]
+    scripts/cpu_check.py [--seconds 12] [--only gpu,gpu-30] [--bin PATH]
 
 Run it in the desktop session where Herdr is slow (e.g. NoMachine), with no
 build running. It opens a test window several times, one per setup below, each
@@ -20,17 +20,20 @@ In each test window a terminal plays the same synthetic output:
   hidden   scroll in a background tab while an idle shell is on screen
 
 and it measures herdr-app's CPU, the part of it in the software rasterizer's
-llvmpipe threads, the window's draws per second and the CPU each draw costs.
+llvmpipe threads, the window's draws per second, the CPU each draw costs and
+how much of the main thread's share goes to building the frame. With Linux perf
+allowed (kernel.perf_event_paranoid 2 or lower), it also samples the main
+thread while the GPU setup scrolls: which functions that time goes to.
 
-Setups (each opens a fresh test window):
+Setups run by default (each opens a fresh test window):
 
-  now        your NoMachine launcher: OpenGL, partial redraw on CPU renderers
-  nopartial  OpenGL, partial redraw off
-  lp4        now, with the software rasterizer limited to 4 threads
-  quarter    now, in a window half the screen's width and height (others maximized)
-  auto       no backend forced: Vulkan and OpenGL adapters tried, GPUs first
-  vgl        now, through VirtualGL on the NVIDIA GPU (VirtualGL 3.1+ installed)
-  nxvgl      now, through the VirtualGL that NoMachine bundles (if present)
+  gl         OpenGL on llvmpipe, partial redraw: the old NoMachine launcher
+  gpu        no backend forced (NVIDIA Vulkan here), draws not capped
+  gpu-30     gpu, draws capped at 30 a second (HERDR_MAX_FPS=30): the new launcher
+  gpu-20     gpu, capped at 20 a second
+
+Round 1's setups (--only to run them): now, nopartial, lp4, quarter, auto, vgl
+(VirtualGL on the NVIDIA GPU) and nxvgl (NoMachine's VirtualGL).
 
 The report holds numbers, GPU adapter names, the screen size and the CPU count:
 no paths, user or host names, terminal contents or environment. Everything
@@ -81,8 +84,18 @@ time.sleep(10 ** 7)
 '''
 
 NOW = {"HERDR_TEST_GPU_BACKEND": "gl", "HERDR_RENDER_PARTIAL": "cpu"}
+GPU = {"HERDR_RENDER_PARTIAL": "cpu"}
+DEFAULT = ["gl", "gpu", "gpu-30", "gpu-20"]
+# The setup and scenario whose main thread perf samples.
+PERF_AT = ("gpu", "scroll")
 # name, what it is, environment, wrapper, window, scenarios
 SETUPS = [
+    ("gl", "OpenGL on llvmpipe, partial redraw (the old NoMachine launcher)", NOW, None, "max", ["scroll"]),
+    ("gpu", "no backend forced, draws not capped", GPU, None, "max",
+     ["idle", "scroll", "burst10", "status", "hidden"]),
+    ("gpu-30", "gpu, draws capped at 30/s (the new NoMachine launcher)", dict(GPU, HERDR_MAX_FPS="30"), None, "max",
+     ["idle", "scroll", "status"]),
+    ("gpu-20", "gpu, draws capped at 20/s", dict(GPU, HERDR_MAX_FPS="20"), None, "max", ["scroll"]),
     ("now", "OpenGL, partial redraw (your NoMachine launcher)", NOW, None, "max",
      ["idle", "scroll", "burst10", "status", "hidden"]),
     ("nopartial", "OpenGL, partial redraw off", {"HERDR_TEST_GPU_BACKEND": "gl"}, None, "max", ["scroll", "status"]),
@@ -236,6 +249,116 @@ def find_hc():
     return None
 
 
+RUST_HASH = re.compile(r"::h[0-9a-f]{16}\b")
+RUST_CRATE_HASH = re.compile(r"(?<=[A-Za-z0-9_])\[[0-9a-f]{4,16}\](?=::|>|,|$)")
+# Frames every main-thread stack passes through: left out of the perf summary.
+TRUNK = re.compile(
+    r"^(_start|main|__libc_start_main.*|__libc_start_call_main|std::rt::.*|std::sys::.*|std::panicking::.*|"
+    r"std::panic::.*|core::ops::function::.*|__rust_try|.*__rust_begin_short_backtrace.*|herdr_app::main)$")
+
+
+def find_perf():
+    """A perf that runs (Ubuntu's /usr/bin/perf refuses without a matching linux-tools)."""
+    cands = [shutil.which("perf")] + sorted(glob.glob("/usr/lib/linux-tools*/perf") +
+                                            glob.glob("/usr/lib/linux-tools/*/perf"), reverse=True)
+    for c in cands:
+        if not c:
+            continue
+        try:
+            r = subprocess.run([c, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.startswith(b"perf version"):
+            return c
+    return None
+
+
+def split_frame(rest):
+    """'symbol (library)' -> (symbol, library), parentheses in either allowed."""
+    if not rest.endswith(")"):
+        return rest, ""
+    depth = 0
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i] == ")":
+            depth += 1
+        elif rest[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return rest[:i].rstrip(), rest[i + 1:-1]
+    return rest, ""
+
+
+class Stacks:
+    """perf's samples of one thread, kept only as counts of function and library
+    names (perf's raw data, which holds stack memory, is deleted with the rest)."""
+
+    HEADER = re.compile(r"^\s*(.*?)\s+(\d+)/(\d+)\s*$")
+    FRAME = re.compile(r"^\s+([0-9a-fA-F]+)\s+(.*)$")
+
+    def __init__(self, clean):
+        self.clean, self.total, self.cache = clean, 0, {}
+        self.incl, self.self_ = {}, {}
+
+    def frame(self, sym, dso):
+        hit = self.cache.get((sym, dso))
+        if hit is None:
+            sym = re.sub(r"\+0x[0-9a-fA-F]+$", "", sym.strip())
+            lib = dso.strip()
+            lib = "[kernel]" if lib.startswith("[kernel") else lib.replace(" (deleted)", "").rstrip("/").rsplit("/", 1)[-1]
+            lib = self.clean(lib)[:40] or "?"
+            hit = self.cache[(sym, dso)] = (sym if sym and sym != "[unknown]" else f"[{lib}]", lib)
+        return hit
+
+    def add(self, frames):
+        if not frames:
+            return
+        self.total += 1
+        self.self_[frames[0]] = self.self_.get(frames[0], 0) + 1
+        for name in {f[0] for f in frames}:
+            self.incl[name] = self.incl.get(name, 0) + 1
+
+    def read(self, stream):
+        cur = None
+        for line in stream:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            if line[0] in " \t":
+                m = self.FRAME.match(line)
+                if m and cur is not None:
+                    cur.append(self.frame(*split_frame(m.group(2))))
+            elif self.HEADER.match(line):
+                self.add(cur or [])
+                cur = []
+        self.add(cur or [])
+
+    def finish(self):
+        """Names perf left mangled (Rust v0, C++) through binutils' c++filt, then cleaned."""
+        names = set(self.incl) | {n for n, _ in self.self_}
+        todo = sorted(n for n in names if n.startswith(("_R", "_ZN")))
+        mapping = {}
+        if todo and shutil.which("c++filt"):
+            try:
+                r = subprocess.run(["c++filt"], input="\n".join(todo) + "\n", stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=120)
+                out = r.stdout.splitlines()
+                if r.returncode == 0 and len(out) == len(todo):
+                    mapping = dict(zip(todo, out))
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        def fix(n):
+            n = self.clean(RUST_CRATE_HASH.sub("", RUST_HASH.sub("", mapping.get(n, n))))
+            return n if len(n) <= 130 else n[:127] + "..."
+
+        incl, self_ = {}, {}
+        for n, c in self.incl.items():
+            incl[fix(n)] = incl.get(fix(n), 0) + c
+        for (n, lib), c in self.self_.items():
+            self_[(fix(n), lib)] = self_.get((fix(n), lib), 0) + c
+        self.incl, self.self_ = incl, self_
+
+
 class Run:
     """One test window: its own home, the shared test core, its own log."""
 
@@ -243,6 +366,7 @@ class Run:
         self.ctx, (self.name, self.what, self.vars, self.wrap, self.window, self.scenarios) = ctx, setup
         self.home = os.path.join(ctx.root, f"home-{self.name}")
         self.proc = None
+        self.perf_proc = None
         self.pid = None
         self.rows = {}
         self.info = {}
@@ -326,6 +450,12 @@ class Run:
         return self.pid is not None
 
     def stop(self):
+        if self.perf_proc and self.perf_proc.poll() is None:
+            try:
+                os.killpg(self.perf_proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            self.perf_proc.wait()
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
@@ -364,9 +494,35 @@ class Run:
 
     def measure(self, scenario):
         time.sleep(SETTLE)
+        c = self.ctx
+        raw = os.path.join(c.root, "perf.data")
+        if c.perf and (self.name, scenario) == PERF_AT:
+            # The main thread only (its id is the process id).
+            self.perf_proc = subprocess.Popen(
+                [c.perf, "record", "-q", "-N", "-o", raw, "-t", str(self.pid),
+                 "-e", "cpu-clock" if os.geteuid() == 0 else "cpu-clock:u", "-c", "2000000",
+                 "--call-graph", "dwarf,16384", "--", "sleep", str(c.seconds)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         a = self.snapshot()
-        time.sleep(self.ctx.seconds)
+        time.sleep(c.seconds)
         b = self.snapshot()
+        if self.perf_proc:
+            try:
+                self.perf_proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.perf_proc.pid, signal.SIGINT)
+                self.perf_proc.wait()
+            self.perf_proc = None
+            if os.path.exists(raw) and os.path.getsize(raw) > 0:
+                say(f"  {self.name}: reading the main thread's perf samples")
+                stacks = Stacks(c.clean)
+                p = subprocess.Popen([c.perf, "script", "-i", raw, "-F", "comm,pid,tid,ip,sym,dso", "--no-inline"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                stacks.read(line.decode("utf-8", "replace") for line in p.stdout)
+                p.wait()
+                stacks.finish()
+                c.stacks = stacks if stacks.total else None
+                os.remove(raw)
         if a is None or b is None or a["app"] is None or b["app"] is None:
             self.rows[scenario] = None
             return
@@ -388,12 +544,17 @@ class Run:
                 rows.append(json.loads(l))
             except ValueError:
                 pass
-        draws = sum(r.get("window", 0) for r in rows) / max(len(rows), 1)
+        per = lambda key: sum(r.get(key, 0) for r in rows) / max(len(rows), 1)
+        draws = per("window")
         app = pct(b["app"] - a["app"])
         self.rows[scenario] = {
             "app": app, "llvm": pct(llvm), "main": pct(main), "core": pct(b["core"] - a["core"]),
             "draws": draws, "llvm_threads": llvm_threads,
             "ms_draw": app * 10 / draws if draws >= 0.5 else None,
+            # Main-thread milliseconds per draw, all of it and building the frame (render to paint).
+            "main_draw": pct(main) * 10 / draws if draws >= 0.5 else None,
+            "build": per("frame_ms") / draws if draws >= 0.5 else None,
+            "term": per("terminal"), "js": per("scripts"),
         }
 
     def play(self):
@@ -457,6 +618,8 @@ def report(ctx, runs, skipped):
     w(f"NVIDIA DRI device: {('yes, usable' if ctx.nvidia_ok else 'yes, NOT accessible to you') if ctx.nvidia else 'none'}; "
       f"VirtualGL: {('installed ' + (ctx.vgl_version or 'version unknown')) if ctx.vgl else 'not installed'}; "
       f"NoMachine VirtualGL: {'present' if ctx.nxvgl else 'none'}")
+    w(f"draw cap (HERDR_MAX_FPS) in this binary: {'yes' if ctx.has_cap else 'no (build the branch with it to test gpu-30/gpu-20)'}; "
+      f"perf: {ctx.perf_note}")
     if ctx.preload_dropped:
         w("note: a VirtualGL/NoMachine LD_PRELOAD in this shell was left out of the test windows")
     adapters = []
@@ -466,7 +629,8 @@ def report(ctx, runs, skipped):
                 adapters.append(a)
     w("adapters found: " + ("; ".join(adapters) or "-"))
     w("")
-    head = f"{'setup':10} {'scenario':8} {'app%':>6} {'llvmpipe%':>9} {'main%':>6} {'core%':>6} {'draws/s':>7} {'ms/draw':>7}  renderer"
+    head = (f"{'setup':10} {'scenario':8} {'app%':>6} {'llvmpipe%':>9} {'main%':>6} {'draws/s':>7} {'ms/draw':>7} "
+            f"{'build':>6} {'term/s':>6} {'js/s':>5}  renderer")
     w(head)
     for r in runs:
         renderer = r.info.get("selected") or "?"
@@ -490,15 +654,29 @@ def report(ctx, runs, skipped):
                 threads = max(x["llvm_threads"] for x in r.rows.values() if x)
                 note = renderer + (" + " + ", ".join(extra) if extra else "") + (f", {threads} llvmpipe threads" if threads else "")
             first = False
-            w(f"{r.name:10} {s:8} {row['app']:6.0f} {row['llvm']:9.0f} {row['main']:6.0f} {row['core']:6.0f} "
-              f"{row['draws']:7.1f} {fmt(row['ms_draw']):>7}  {note}")
+            w(f"{r.name:10} {s:8} {row['app']:6.0f} {row['llvm']:9.0f} {row['main']:6.0f} "
+              f"{row['draws']:7.1f} {fmt(row['ms_draw']):>7} {fmt(row.get('build'), 1):>6} "
+              f"{row.get('term', 0):6.1f} {row.get('js', 0):5.1f}  {note}")
         for f in r.info.get("failed", []):
             w(f"{'':10} adapter failed: {f}")
     for name, why in skipped:
         w(f"{name:10} skipped: {why}")
     w("")
-    w("ms/draw = CPU milliseconds herdr-app spends per window draw (all threads)")
+    w("ms/draw = CPU ms per window draw, all threads; build = main-thread ms per draw building it (render to paint);")
+    w("term/s = terminal renders a second; js/s = mod script renders a second")
     w("")
+    st = getattr(ctx, "stacks", None)
+    if st:
+        w(f"Main thread while {PERF_AT[0]} {PERF_AT[1]}s (perf, {st.total} samples, each 2 ms of its CPU time)")
+        w("  inclusive (the function and all it calls):")
+        shown = [(n, c) for n, c in sorted(st.incl.items(), key=lambda x: -x[1])
+                 if c < st.total * 0.995 and not TRUNK.match(n)][:24]
+        for n, c in shown:
+            w(f"  {100 * c / st.total:5.1f}  {n}")
+        w("  self (time in the function itself):")
+        for (n, lib), c in sorted(st.self_.items(), key=lambda x: -x[1])[:12]:
+            w(f"  {100 * c / st.total:5.1f}  {n[:100]}  [{lib}]")
+        w("")
 
     def row(setup, scenario):
         for r in runs:
@@ -507,9 +685,38 @@ def report(ctx, runs, skipped):
         return None
 
     def verdict(tag, ok, text):
-        w(f"  {tag:4} {'NOT TESTED' if ok is None else 'CONFIRMED ' if ok else 'REFUTED   '} {text}")
+        if ok is not None:
+            w(f"  {tag:4} {'CONFIRMED ' if ok else 'REFUTED   '} {text}")
 
-    w("Hypotheses")
+    w("Hypotheses (only those this run tested)")
+    gl, g = row("gl", "scroll"), row("gpu", "scroll")
+    gpu = next((r for r in runs if r.name == "gpu"), None)
+    if g and gpu:
+        sel = gpu.info.get("selected") or ""
+        verdict("R1", g["llvm"] <= max(5, 0.05 * g["app"]) and bool(sel) and not SOFTWARE.search(sel),
+                f"with no backend forced, the GPU draws: {sel or '?'}, llvmpipe {g['llvm']:.0f}% of {g['app']:.0f}%")
+    if g and gl:
+        verdict("R2", g["app"] <= 0.15 * gl["app"],
+                f"scrolling on the GPU costs a small fraction of OpenGL on llvmpipe: {g['app']:.0f}% vs {gl['app']:.0f}%")
+    gi, gh = row("gpu", "idle"), row("gpu", "hidden")
+    if gi and gh:
+        verdict("R3", gi["app"] < 3 and gh["app"] < 5,
+                f"on the GPU, nothing printing and output in a hidden tab cost ~nothing: {gi['app']:.1f}% and {gh['app']:.1f}%")
+    if g:
+        verdict("R4", g["draws"] <= 33,
+                f"scrolling draws at most ~30 times a second (the terminal's output clock): {g['draws']:.0f} draws/s,"
+                f" {g['term']:.0f} terminal renders/s, {g['js']:.0f} mod script renders/s")
+    g30, g20 = row("gpu-30", "scroll"), row("gpu-20", "scroll")
+    if g and (g30 or g20) and ctx.has_cap:
+        best = min(x["app"] for x in (g30, g20) if x)
+        verdict("R5", best <= 0.75 * g["app"],
+                f"capping draws cuts scrolling CPU: {g['app']:.0f}% at {g['draws']:.0f}/s"
+                + (f", {g30['app']:.0f}% at {g30['draws']:.0f}/s (cap 30)" if g30 else "")
+                + (f", {g20['app']:.0f}% at {g20['draws']:.0f}/s (cap 20)" if g20 else ""))
+    if g and g["main_draw"] and g["build"] is not None:
+        verdict("R6", g["build"] >= 0.6 * g["main_draw"],
+                f"most of the main thread's time per draw is building the frame, not presenting it:"
+                f" {g['build']:.1f} of {g['main_draw']:.1f} ms")
     s = row("now", "scroll")
     verdict("H1", None if not s else s["llvm"] >= 0.7 * s["app"],
             "the CPU goes to the software rasterizer (llvmpipe threads)"
@@ -549,7 +756,8 @@ def report(ctx, runs, skipped):
     ok = None
     if a and auto:
         selected = auto.info.get("selected") or ""
-        ok = a["llvm_threads"] == 0 and bool(selected) and not SOFTWARE.search(selected)
+        # wgpu starts llvmpipe threads while it probes the software adapters; idle ones don't count.
+        ok = a["llvm"] <= max(5, 0.05 * a["app"]) and bool(selected) and not SOFTWARE.search(selected)
     verdict("H9", ok, "the GPU works without VirtualGL (Vulkan or GL picked on their own)"
             + (f": picked {auto.info.get('selected')}, {a['app']:.0f}% while scrolling" if a and auto else ""))
     for name, tag in (("vgl", "H10"), ("nxvgl", "H11")):
@@ -558,7 +766,8 @@ def report(ctx, runs, skipped):
         ok = None
         if v and s:
             selected = run.info.get("selected") or ""
-            ok = (v["llvm_threads"] == 0 and not SOFTWARE.search(selected) and v["app"] <= max(0.25 * s["app"], 30))
+            ok = (v["llvm"] <= max(5, 0.05 * v["app"]) and not SOFTWARE.search(selected)
+                  and v["app"] <= max(0.25 * s["app"], 30))
         label = "VirtualGL on the NVIDIA GPU" if name == "vgl" else "NoMachine's VirtualGL"
         verdict(tag, ok, f"{label} takes the drawing off the CPU"
                 + (f": {v['app']:.0f}% vs {s['app']:.0f}% while scrolling, renderer {run.info.get('selected')}" if v and s and run else ""))
@@ -614,8 +823,19 @@ def main():
     ctx.preload_dropped = any(s in os.environ.get("LD_PRELOAD", "") for s in ("vgl", "faker", "/NX/"))
     ctx.vgl, ctx.vgl_version, ctx.nxvgl = find_vgl()
     ctx.nvidia, ctx.nvidia_ok = nvidia_device()
+    with open(ctx.bin, "rb") as f:
+        ctx.has_cap = b"HERDR_MAX_FPS" in f.read()
+    ctx.stacks = None
+    ctx.perf = find_perf()
+    paranoid = (read("/proc/sys/kernel/perf_event_paranoid") or "2").strip()
+    if not ctx.perf:
+        ctx.perf_note = "not installed (no main-thread breakdown)"
+    elif os.geteuid() != 0 and not (paranoid.lstrip("-").isdigit() and int(paranoid) <= 2):
+        ctx.perf, ctx.perf_note = None, f"not allowed (kernel.perf_event_paranoid={paranoid})"
+    else:
+        ctx.perf_note = f"samples the main thread during {PERF_AT[0]} {PERF_AT[1]}"
 
-    wanted = set(args.only.split(",")) if args.only else None
+    wanted = set(args.only.split(",")) if args.only else set(DEFAULT)
     setups, skipped = [], []
     for s in SETUPS:
         if wanted and s[0] not in wanted:
