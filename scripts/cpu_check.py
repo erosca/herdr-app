@@ -2,7 +2,7 @@
 """Tests, one setup at a time, why herdr-app uses so much CPU on this machine,
 and prints a short report to paste back.
 
-    scripts/cpu_check.py [--seconds 12] [--only gpu,gpu-30] [--bin PATH]
+    scripts/cpu_check.py [--seconds 12] [--only gpu,cap20] [--bin PATH]
 
 Run it in the desktop session where Herdr is slow (e.g. NoMachine), with no
 build running. It opens a test window several times, one per setup below, each
@@ -27,13 +27,16 @@ thread while the GPU setup scrolls: which functions that time goes to.
 
 Setups run by default (each opens a fresh test window):
 
-  gl         OpenGL on llvmpipe, partial redraw: the old NoMachine launcher
-  gpu        no backend forced (NVIDIA Vulkan here), draws not capped
-  gpu-30     gpu, draws capped at 30 a second (HERDR_MAX_FPS=30): the new launcher
-  gpu-20     gpu, capped at 20 a second
+  gpu          no backend forced (NVIDIA Vulkan here), Fifo present, no draw cap
+  gpu-imm      gpu, Immediate present (no wait for the display's refresh)
+  gpu-mailbox  gpu, Mailbox present
+  gpu-yield    gpu, NVIDIA's driver told to sleep rather than spin while it waits
+               (__GL_YIELD=USLEEP)
+  cap30 .. cap10  gpu, draws capped at 30, 20 (the NoMachine launcher), 15 and 10
+               a second (HERDR_MAX_FPS)
 
-Round 1's setups (--only to run them): now, nopartial, lp4, quarter, auto, vgl
-(VirtualGL on the NVIDIA GPU) and nxvgl (NoMachine's VirtualGL).
+Earlier rounds' setups (--only to run them): gl (OpenGL on llvmpipe), gpu-30,
+gpu-20, now, nopartial, lp4, quarter, auto, vgl and nxvgl.
 
 The report holds numbers, GPU adapter names, the screen size and the CPU count:
 no paths, user or host names, terminal contents or environment. Everything
@@ -85,14 +88,24 @@ time.sleep(10 ** 7)
 
 NOW = {"HERDR_TEST_GPU_BACKEND": "gl", "HERDR_RENDER_PARTIAL": "cpu"}
 GPU = {"HERDR_RENDER_PARTIAL": "cpu"}
-DEFAULT = ["gl", "gpu", "gpu-30", "gpu-20"]
+DEFAULT = ["gpu", "gpu-imm", "gpu-mailbox", "gpu-yield", "cap30", "cap20", "cap15", "cap10"]
+FIFO = dict(GPU, HERDR_TEST_PRESENT_MODE="fifo")  # Fifo is the default; naming it logs the modes there are
 # The setup and scenario whose main thread perf samples.
 PERF_AT = ("gpu", "scroll")
 # name, what it is, environment, wrapper, window, scenarios
 SETUPS = [
     ("gl", "OpenGL on llvmpipe, partial redraw (the old NoMachine launcher)", NOW, None, "max", ["scroll"]),
-    ("gpu", "no backend forced, draws not capped", GPU, None, "max",
-     ["idle", "scroll", "burst10", "status", "hidden"]),
+    ("gpu", "no backend forced, Fifo present, draws not capped", FIFO, None, "max",
+     ["idle", "scroll", "status", "hidden"]),
+    ("gpu-imm", "gpu, Immediate present", dict(GPU, HERDR_TEST_PRESENT_MODE="immediate"), None, "max",
+     ["scroll", "status"]),
+    ("gpu-mailbox", "gpu, Mailbox present", dict(GPU, HERDR_TEST_PRESENT_MODE="mailbox"), None, "max", ["scroll"]),
+    ("gpu-yield", "gpu, __GL_YIELD=USLEEP", dict(FIFO, __GL_YIELD="USLEEP"), None, "max", ["scroll"]),
+    ("cap30", "gpu, draws capped at 30/s", dict(FIFO, HERDR_MAX_FPS="30"), None, "max", ["scroll"]),
+    ("cap20", "gpu, draws capped at 20/s (the NoMachine launcher)", dict(FIFO, HERDR_MAX_FPS="20"), None, "max",
+     ["scroll", "status"]),
+    ("cap15", "gpu, draws capped at 15/s", dict(FIFO, HERDR_MAX_FPS="15"), None, "max", ["scroll"]),
+    ("cap10", "gpu, draws capped at 10/s", dict(FIFO, HERDR_MAX_FPS="10"), None, "max", ["scroll"]),
     ("gpu-30", "gpu, draws capped at 30/s (the new NoMachine launcher)", dict(GPU, HERDR_MAX_FPS="30"), None, "max",
      ["idle", "scroll", "status"]),
     ("gpu-20", "gpu, draws capped at 20/s", dict(GPU, HERDR_MAX_FPS="20"), None, "max", ["scroll"]),
@@ -110,7 +123,8 @@ SETUPS = [
 LOOK = ["HERDR_VTE_COMPAT", "HERDR_FONT_HINTING", "ZED_FONTS_GAMMA", "ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST",
         "ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST", "GPUI_X11_SCALE_FACTOR"]
 # Left out of the test windows' environment: each setup sets its own.
-SCRUB = ("HC_", "HERDR_", "VGL", "LP_", "WGPU_", "GALLIUM_", "LIBGL_", "MESA_", "__GLX_", "__EGL_", "ZED_", "GPUI_")
+SCRUB = ("HC_", "HERDR_", "VGL", "LP_", "WGPU_", "GALLIUM_", "LIBGL_", "MESA_", "__GLX_", "__EGL_", "__GL_", "ZED_",
+         "GPUI_")
 
 
 def say(msg):
@@ -530,8 +544,11 @@ class Run:
         pct = lambda n: 100.0 * n / CLK / dt
         llvm = main = 0
         llvm_threads = 0
+        groups = {}
         for tid, (comm, t) in b["threads"].items():
             used = t - a["threads"].get(tid, (comm, 0))[1]
+            group = "main" if tid == self.pid else re.sub(r"\d+", "N", c.clean(comm)) or "?"
+            groups[group] = groups.get(group, 0) + used
             if comm.startswith("llvmpipe"):
                 llvm += used
                 llvm_threads += 1
@@ -555,6 +572,7 @@ class Run:
             "main_draw": pct(main) * 10 / draws if draws >= 0.5 else None,
             "build": per("frame_ms") / draws if draws >= 0.5 else None,
             "term": per("terminal"), "js": per("scripts"),
+            "threads": [(g, pct(n)) for g, n in sorted(groups.items(), key=lambda x: -x[1])[:3] if n],
         }
 
     def play(self):
@@ -576,7 +594,7 @@ class Run:
         clean = self.ctx.clean
         text = re.sub(r"\x1b\[[0-9;]*m", "", read(os.path.join(self.home, "app.log")) or "")
         adapters, failed = [], []
-        selected = scale = None
+        selected = scale = present = modes = None
         partial = False
         for line in text.splitlines():
             m = re.search(r"  - (.+?) \(vendor=0x[0-9a-f]+, device=0x[0-9a-f]+, backend=(\w+), type=(\w+)\)", line)
@@ -592,10 +610,13 @@ class Run:
             if m:
                 scale = m.group(1)
             partial = partial or "partial redraw enabled" in line
+            m = re.search(r"\[HERDR_LATENCY_EXPERIMENT\] requested=\S+ chosen=(\w+) available=\[([^\]]*)\]", line)
+            if m:
+                present, modes = m.group(1), m.group(2).replace(" ", "")
         errors = [clean(l.strip())[:150] for l in text.splitlines() if re.search(r"panicked|ERROR|error:", l)][:3]
         maps = read(f"/proc/{self.pid}/maps") if self.pid else ""
         self.info = {"adapters": adapters, "selected": selected, "failed": failed, "scale": scale,
-                     "partial": partial, "errors": errors,
+                     "partial": partial, "errors": errors, "present": present, "modes": modes,
                      "vgl_loaded": bool(maps and re.search(r"vglfaker|libvgl", maps))}
 
 
@@ -629,7 +650,7 @@ def report(ctx, runs, skipped):
                 adapters.append(a)
     w("adapters found: " + ("; ".join(adapters) or "-"))
     w("")
-    head = (f"{'setup':10} {'scenario':8} {'app%':>6} {'llvmpipe%':>9} {'main%':>6} {'draws/s':>7} {'ms/draw':>7} "
+    head = (f"{'setup':11} {'scenario':8} {'app%':>6} {'llvmpipe%':>9} {'main%':>6} {'draws/s':>7} {'ms/draw':>7} "
             f"{'build':>6} {'term/s':>6} {'js/s':>5}  renderer")
     w(head)
     for r in runs:
@@ -641,6 +662,8 @@ def report(ctx, runs, skipped):
             extra.append("VirtualGL " + ("active" if r.info.get("vgl_loaded") else "NOT loaded"))
         if r.info.get("scale"):
             extra.append(f"scale {r.info['scale']}")
+        if r.info.get("present"):
+            extra.append(f"present {r.info['present']} (of {r.info.get('modes')})")
         if not r.rows:
             w(f"{r.name:10} {'-':8} did not start" + (": " + " | ".join(r.info.get("errors", [])) if r.info.get("errors") else ""))
             continue
@@ -654,9 +677,11 @@ def report(ctx, runs, skipped):
                 threads = max(x["llvm_threads"] for x in r.rows.values() if x)
                 note = renderer + (" + " + ", ".join(extra) if extra else "") + (f", {threads} llvmpipe threads" if threads else "")
             first = False
-            w(f"{r.name:10} {s:8} {row['app']:6.0f} {row['llvm']:9.0f} {row['main']:6.0f} "
+            w(f"{r.name:11} {s:8} {row['app']:6.0f} {row['llvm']:9.0f} {row['main']:6.0f} "
               f"{row['draws']:7.1f} {fmt(row['ms_draw']):>7} {fmt(row.get('build'), 1):>6} "
               f"{row.get('term', 0):6.1f} {row.get('js', 0):5.1f}  {note}")
+            if s in ("idle", "hidden") and row.get("threads"):
+                w(f"{'':11} {'':8} busiest threads: " + ", ".join(f"{g} {v:.1f}%" for g, v in row["threads"]))
         for f in r.info.get("failed", []):
             w(f"{'':10} adapter failed: {f}")
     for name, why in skipped:
@@ -689,8 +714,36 @@ def report(ctx, runs, skipped):
             w(f"  {tag:4} {'CONFIRMED ' if ok else 'REFUTED   '} {text}")
 
     w("Hypotheses (only those this run tested)")
-    gl, g = row("gl", "scroll"), row("gpu", "scroll")
+    g = row("gpu", "scroll")
+    if g and any(r.name.startswith("cap") or r.name in ("gpu-imm", "gpu-mailbox", "gpu-yield") for r in runs):
+        verdict("S1", g["draws"] <= 33,
+                f"one printing terminal draws at most ~30 times a second (the output clock fix): {g['draws']:.0f} draws/s")
+        for tag, name, what in (("S2", "gpu-imm", "Immediate present"), ("S3", "gpu-mailbox", "Mailbox present"),
+                                ("S4", "gpu-yield", "__GL_YIELD=USLEEP")):
+            x = row(name, "scroll")
+            run = next((r for r in runs if r.name == name), None)
+            if x and g["ms_draw"] and x["ms_draw"] and run:
+                mode = run.info.get("present")
+                fell_back = name != "gpu-yield" and mode and mode.lower() != what.split()[0].lower()
+                verdict(tag, x["ms_draw"] <= 0.75 * g["ms_draw"],
+                        f"{what} costs less CPU per draw than Fifo: {x['ms_draw']:.1f} vs {g['ms_draw']:.1f} ms"
+                        f" ({x['app']:.0f}% vs {g['app']:.0f}% scrolling)"
+                        + (f"; NOTE: the driver gave {mode} instead" if fell_back else ""))
+        caps = [(n, int(n[3:]), row(n, "scroll")) for n in ("cap30", "cap20", "cap15", "cap10")]
+        caps = [(n, fps, x) for n, fps, x in caps if x]
+        if caps:
+            verdict("S5", all(abs(x["draws"] - min(fps, g["draws"])) <= 0.15 * fps for _, fps, x in caps),
+                    "the draw cap holds its rate, and CPU follows it: "
+                    + ", ".join(f"cap {fps}: {x['app']:.0f}% at {x['draws']:.0f}/s" for _, fps, x in caps)
+                    + f" (no cap: {g['app']:.0f}% at {g['draws']:.0f}/s)")
+        gi, gh = row("gpu", "idle"), row("gpu", "hidden")
+        if gi and gh:
+            verdict("S6", gi["app"] < 2 and gh["app"] < 3,
+                    f"nothing on screen changing costs ~nothing: idle {gi['app']:.1f}%, output in a hidden tab {gh['app']:.1f}%")
+    gl = row("gl", "scroll")
     gpu = next((r for r in runs if r.name == "gpu"), None)
+    if not any(r.name in ("gl", "gpu-30", "gpu-20") for r in runs):
+        gpu = g = None  # round 2's verdicts, only when its setups ran
     if g and gpu:
         sel = gpu.info.get("selected") or ""
         verdict("R1", g["llvm"] <= max(5, 0.05 * g["app"]) and bool(sel) and not SOFTWARE.search(sel),
@@ -699,7 +752,7 @@ def report(ctx, runs, skipped):
         verdict("R2", g["app"] <= 0.15 * gl["app"],
                 f"scrolling on the GPU costs a small fraction of OpenGL on llvmpipe: {g['app']:.0f}% vs {gl['app']:.0f}%")
     gi, gh = row("gpu", "idle"), row("gpu", "hidden")
-    if gi and gh:
+    if g and gi and gh:
         verdict("R3", gi["app"] < 3 and gh["app"] < 5,
                 f"on the GPU, nothing printing and output in a hidden tab cost ~nothing: {gi['app']:.1f}% and {gh['app']:.1f}%")
     if g:
