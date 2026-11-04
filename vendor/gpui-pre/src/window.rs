@@ -153,9 +153,10 @@ enum FrameRateLimit {
 
 /// HERDR: `HERDR_MAX_FPS=<n>` caps how often a window draws, whatever asked for the
 /// frame (a terminal printing, a mod re-rendering): what changes in between is drawn
-/// together in the next allowed frame, at most one interval late (33 ms at 30).
-/// Forced renders and presentation-only frames aren't held back. Unset, 0 or not a
-/// number: no cap. Read once.
+/// together in the next allowed frame, at most one interval late (50 ms at 20).
+/// Within `HERDR_INPUT_GRACE` of a key or pointer event nothing is held back, so
+/// typing and scrolling stay immediate; nor are forced renders and
+/// presentation-only frames. Unset, 0 or not a number: no cap. Read once.
 fn herdr_max_fps_interval() -> Option<Duration> {
     static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *INTERVAL.get_or_init(|| {
@@ -163,6 +164,9 @@ fn herdr_max_fps_interval() -> Option<Duration> {
         (fps.is_finite() && fps > 0.0).then(|| Duration::from_secs_f64(1.0 / fps))
     })
 }
+
+/// HERDR: how long after input `HERDR_MAX_FPS` lets every frame through.
+const HERDR_INPUT_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct WindowInvalidator {
@@ -1279,6 +1283,8 @@ struct ModifierState {
 /// Used for selective VRR (Variable Refresh Rate) optimization.
 #[derive(Clone, Debug)]
 pub(crate) struct InputRateTracker {
+    /// HERDR: the last input event of any kind, for HERDR_MAX_FPS.
+    last_input: Option<Instant>,
     timestamps: Vec<Instant>,
     window: Duration,
     inputs_per_second: u32,
@@ -1289,6 +1295,7 @@ pub(crate) struct InputRateTracker {
 impl Default for InputRateTracker {
     fn default() -> Self {
         Self {
+            last_input: None,
             timestamps: Vec::new(),
             window: Duration::from_millis(100),
             inputs_per_second: 60,
@@ -1299,6 +1306,17 @@ impl Default for InputRateTracker {
 }
 
 impl InputRateTracker {
+    /// HERDR: an input event arrived (whether or not it changed anything yet: a key
+    /// typed into a terminal only shows when the program echoes it).
+    pub fn note_input(&mut self) {
+        self.last_input = Some(Instant::now());
+    }
+
+    /// HERDR: whether input arrived within `d`.
+    pub fn input_within(&self, d: Duration) -> bool {
+        self.last_input.is_some_and(|t| Instant::now().duration_since(t) < d)
+    }
+
     pub fn record_input(&mut self) {
         let now = Instant::now();
         self.timestamps.push(now);
@@ -1774,13 +1792,17 @@ impl Window {
 
                 // HERDR: HERDR_MAX_FPS holds a draw back until its interval has passed since
                 // the last one; the window stays invalidated, so a later request draws it
-                // (on X11 the next tick of the refresh timer).
+                // (on X11 the next tick of the refresh timer). Refresh ticks land a little
+                // either side of whole frames: within a quarter of the interval (at most
+                // 4 ms) counts as on time, or a cap of 30 on a 60 Hz display drew ~21.
                 if !force_render
                     && !request_frame_options.require_presentation
                     && invalidator.is_dirty()
                     && let Some(interval) = herdr_max_fps_interval()
+                    && !input_rate_tracker.borrow().input_within(HERDR_INPUT_GRACE)
                     && let Some(last_draw) = last_draw_time.get()
-                    && Instant::now().duration_since(last_draw) < interval
+                    && Instant::now().duration_since(last_draw) + (interval / 4).min(Duration::from_millis(4))
+                        < interval
                 {
                     handle
                         .update(&mut cx, |_, window, _| {
@@ -5502,6 +5524,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
+        self.input_rate_tracker.borrow_mut().note_input();
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
