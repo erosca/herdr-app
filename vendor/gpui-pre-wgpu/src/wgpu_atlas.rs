@@ -36,6 +36,11 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    // HERDR: bumped when space a drawn sprite used can get other pixels (a tile is removed, so
+    // a later upload may reuse its space, or the atlas is reset), so a renderer that keeps the
+    // last frame's pixels (partial redraw) knows its sprites may be stale. Uploads alone only
+    // fill fresh space and leave drawn sprites intact.
+    content_epoch: u64,
 }
 
 pub struct WgpuTextureInfo {
@@ -59,6 +64,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            content_epoch: 0,
         })))
     }
 
@@ -73,6 +79,12 @@ impl WgpuAtlas {
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.backend.flush_uploads();
+    }
+
+    /// HERDR: changes whenever pixels a previous frame sampled may have changed (removals,
+    /// resets). Read it after [`Self::before_frame`].
+    pub(crate) fn content_epoch(&self) -> u64 {
+        self.0.lock().backend.content_epoch
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -94,6 +106,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.content_epoch = textures.content_epoch.wrapping_add(1);
         });
     }
 
@@ -106,6 +119,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.content_epoch = textures.content_epoch.wrapping_add(1);
         });
     }
 }
@@ -143,6 +157,7 @@ impl AtlasBackend for WgpuAtlasTextures {
         };
 
         if let Some(mut texture) = texture_slot.take() {
+            self.content_epoch = self.content_epoch.wrapping_add(1);
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {

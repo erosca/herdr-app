@@ -2914,6 +2914,15 @@ impl AppWindow {
                     self.focused_pane = None;
                 }
             }
+            "terminal.scroll" => {
+                let Some(by) = a.get("by").and_then(crate::terminal::Scroll::parse) else {
+                    return self.fail("terminal.scroll: by is page_up, page_down, bottom or a number of lines (negative: up)");
+                };
+                if let Some(t) = self.focused_terminal(window) {
+                    t.view.update(cx, |v, cx| v.scroll_by(by, cx));
+                }
+                return;
+            }
             "terminal.copy" | "terminal.paste" | "terminal.paste_image" => {
                 if let Some(t) = self.focused_terminal(window) {
                     t.view.update(cx, |v, cx| match name {
@@ -4728,7 +4737,7 @@ mod tests {
             assert!(!super::needs_model_pane(name, &json!({})), "{name}");
             assert!(!super::needs_model_pane(name, &json!({"place": "tab"})), "{name}");
         }
-        for name in ["pane.focus", "terminal.copy", "terminal.paste", "terminal.paste_image", "terminal.right_click"] {
+        for name in ["pane.focus", "terminal.copy", "terminal.paste", "terminal.paste_image", "terminal.right_click", "terminal.scroll"] {
             assert!(!super::needs_model_pane(name, &json!({})), "{name}");
         }
     }

@@ -1,0 +1,2 @@
+# Herdr sends Shift+Enter as its own key (agents use it for a new line); in the shell it is Enter.
+"\e[27;2;13~": accept-line

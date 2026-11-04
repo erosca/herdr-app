@@ -289,6 +289,14 @@ Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when 
 
 No arguments.
 
+## `terminal.scroll`
+
+Scroll the focused terminal's history by "page_up", "page_down", "bottom" or a number of lines (negative: up). A full-screen program (an editor, a pager) has no history here: it gets PageUp, PageDown or arrow keys instead.
+
+| Argument | Required |
+|---|---|
+| `by` | yes |
+
 ## `agent.focus`
 
 Show an agent (sub-agents too).

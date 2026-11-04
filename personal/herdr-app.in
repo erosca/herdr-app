@@ -1,0 +1,12 @@
+#!/bin/sh
+# Herdr from this fork, with personal render settings.
+# Written by personal/setup.sh; edit personal/herdr-app.in instead.
+# Text like Tilix (all machines): thinner light-on-dark strokes, and cells and
+# glyph positions measured as VTE terminals do (whole-pixel cells, no extra
+# line spacing, regular weight).
+export ZED_FONTS_GAMMA=1.0 HERDR_VTE_COMPAT=1
+#NOMACHINE # NoMachine desktop (setup.sh --nomachine): its session exports
+#NOMACHINE # WAYLAND_DISPLAY=no, and rendering is software, so GL + partial redraw.
+#NOMACHINE unset WAYLAND_DISPLAY WAYLAND_SOCKET
+#NOMACHINE export HERDR_RENDER_PARTIAL=cpu HERDR_TEST_GPU_BACKEND=gl
+exec "@REPO@/target/release/herdr-app" "$@"
