@@ -61,6 +61,8 @@ pub struct Theme {
     /// Selected cells swap their colors (settings.json `invert_selection`) rather
     /// than take `selection_bg`.
     pub invert_selection: bool,
+    /// Bold text in palette colors 0-7 is drawn in 8-15 (settings.json `bold_is_bright`).
+    pub bold_is_bright: bool,
 }
 
 /// The terminal colors from settings.json's theme.
@@ -81,6 +83,7 @@ pub fn theme() -> Theme {
         palette16,
         minimum_contrast: s.minimum_contrast,
         invert_selection: s.invert_selection,
+        bold_is_bright: s.bold_is_bright,
     }
 }
 
@@ -1395,6 +1398,8 @@ impl Vt {
             ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &mut colors as *mut _ as *mut c_void);
             let fg_default = Rgb::from(colors.foreground);
             let bg_default = Rgb::from(colors.background);
+            // The bright colors as the terminal has them now (a program may set them).
+            let bright: [Rgb; 8] = std::array::from_fn(|i| Rgb::from(colors.palette[i + 8]));
 
             // Rows libghostty keeps clean are taken as read last frame (see
             // "Row Identity" in its render.h); a resize or new colors (which
@@ -1426,7 +1431,7 @@ impl Vt {
                         let mut row = Vec::with_capacity(self.cols as usize);
                         let mut x: u16 = 0;
                         while ghostty_render_state_row_cells_next(self.cells) {
-                            row.push(self.read_cell(fg_default, selected && x >= sel.start_x && x <= sel.end_x));
+                            row.push(self.read_cell(fg_default, &bright, selected && x >= sel.start_x && x <= sel.end_x));
                             x += 1;
                         }
                         Rc::new(row)
@@ -1460,7 +1465,7 @@ impl Vt {
         }
     }
 
-    unsafe fn read_cell(&mut self, fg_default: Rgb, selected: bool) -> Cell {
+    unsafe fn read_cell(&mut self, fg_default: Rgb, bright: &[Rgb; 8], selected: bool) -> Cell {
         unsafe {
             let c = self.cells;
             let mut raw: GhosttyCell = Default::default();
@@ -1485,6 +1490,14 @@ impl Vt {
                 .then(|| Rgb::from(bg));
 
             let (mut fg, mut bg) = (fg, bg);
+            // As VTE's "Show bold text in bright colors": only bold text, only the
+            // first eight palette colors, only its text color (backgrounds stay).
+            if self.theme.bold_is_bright && style.bold && style.fg_color.tag == GHOSTTY_STYLE_COLOR_PALETTE {
+                let i = usize::from(style.fg_color.value.palette);
+                if i < 8 {
+                    fg = bright[i];
+                }
+            }
             if style.inverse {
                 let new_fg = bg.unwrap_or(self.theme.bg);
                 bg = Some(fg);
@@ -1901,6 +1914,25 @@ mod tests {
         // A Shift+click inside it moves its end back.
         assert!(vt.extend_selection(5, 0));
         assert_eq!(vt.selection_text().as_deref(), Some("e 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
+    }
+
+    #[test]
+    fn bold_is_bright_brightens_only_bold_text_in_the_first_eight_colors() {
+        let mut vt = Vt::new(12, 2);
+        let t = theme();
+        // Bold blue, plain blue, a blue background, bold bright blue, bold truecolor.
+        vt.write(b"\x1b[1;34mB\x1b[0m\x1b[34mn\x1b[0m\x1b[44m \x1b[0m\x1b[1;94mX\x1b[0m\x1b[1;38;2;1;2;3mT");
+        let fg = |vt: &mut Vt, x: usize| vt.frame().rows[0][x].fg;
+        assert_eq!(fg(&mut vt, 0), t.palette16[4], "off by default");
+
+        vt.set_theme(Theme { bold_is_bright: true, ..t.clone() });
+        let frame = vt.frame();
+        let cell = |x: usize| &frame.rows[0][x];
+        assert_eq!(cell(0).fg, t.palette16[12], "bold blue text turns bright blue");
+        assert_eq!(cell(1).fg, t.palette16[4], "plain blue text stays");
+        assert_eq!(cell(2).bg, Some(t.palette16[4]), "a blue background stays");
+        assert_eq!(cell(3).fg, t.palette16[12], "bright colors stay as they are");
+        assert_eq!(cell(4).fg, Rgb(1, 2, 3), "truecolor stays");
     }
 
     #[test]

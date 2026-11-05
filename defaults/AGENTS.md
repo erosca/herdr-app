@@ -674,6 +674,10 @@ What's about the user, never a look:
   background colors swapped, as VTE terminals (GNOME Terminal, Tilix) do;
   `false` (default) puts it on the theme's `selection` color. Changes apply
   immediately.
+- `bold_is_bright`: `true` draws bold terminal text in the first eight palette
+  colors in their bright counterparts (colors 8-15), as VTE terminals' "Show bold
+  text in bright colors" does; plain text and backgrounds keep their colors.
+  `false` (default) leaves colors as programs set them. Changes apply immediately.
 - `clipboard_write`: `false` blocks terminal programs from writing the local
   clipboard (default `true`, including remote terminals attached in this window).
   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,
