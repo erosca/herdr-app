@@ -58,6 +58,9 @@ pub struct Theme {
     pub selection_bg: Rgb,
     pub palette16: [Rgb; 16],
     pub minimum_contrast: f32,
+    /// Selected cells swap their colors (settings.json `invert_selection`) rather
+    /// than take `selection_bg`.
+    pub invert_selection: bool,
 }
 
 /// The terminal colors from settings.json's theme.
@@ -69,7 +72,16 @@ pub fn theme() -> Theme {
     for (i, c) in palette16.iter_mut().enumerate() {
         *c = get(&format!("ansi{i}"));
     }
-    Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16, minimum_contrast: crate::settings::get().minimum_contrast }
+    let s = crate::settings::get();
+    Theme {
+        fg: get("terminal_foreground"),
+        bg: get("background"),
+        cursor: get("cursor"),
+        selection_bg: get("selection"),
+        palette16,
+        minimum_contrast: s.minimum_contrast,
+        invert_selection: s.invert_selection,
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1478,7 +1490,13 @@ impl Vt {
                 bg = Some(fg);
                 fg = new_fg;
             }
-            if selected {
+            if selected && self.theme.invert_selection {
+                // As VTE terminals show a selection: each cell's own colors swapped
+                // (so reverse-video text shows plain).
+                let new_fg = bg.unwrap_or(self.theme.bg);
+                bg = Some(fg);
+                fg = new_fg;
+            } else if selected {
                 bg = Some(self.theme.selection_bg);
             }
             let mut text = String::new();
@@ -1883,6 +1901,26 @@ mod tests {
         // A Shift+click inside it moves its end back.
         assert!(vt.extend_selection(5, 0));
         assert_eq!(vt.selection_text().as_deref(), Some("e 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
+    }
+
+    #[test]
+    fn inverted_selections_swap_each_cells_colors() {
+        let mut vt = Vt::new(12, 2);
+        let t = theme();
+        vt.write(b"\x1b[38;2;200;10;10mred\x1b[0m \x1b[7mrev\x1b[0m x");
+        vt.select(Select::Press, 0, 0, 2.0, 5.0, 10.0, 40.0);
+        vt.select(Select::Drag, 6, 0, 66.0, 5.0, 10.0, 40.0);
+        vt.select(Select::Release, 6, 0, 66.0, 5.0, 10.0, 40.0);
+        assert_eq!(vt.selection_text().as_deref(), Some("red rev"));
+        assert_eq!(vt.frame().rows[0][0].bg, Some(t.selection_bg), "by default the theme's selection color");
+
+        vt.set_theme(Theme { invert_selection: true, ..t.clone() });
+        let frame = vt.frame();
+        let cell = |x: usize| (frame.rows[0][x].fg, frame.rows[0][x].bg);
+        assert_eq!(cell(0), (t.bg, Some(Rgb(200, 10, 10))), "colored text: its color becomes the background");
+        assert_eq!(cell(3), (t.bg, Some(t.fg)), "a blank between words too");
+        assert_eq!(cell(4), (t.fg, Some(t.bg)), "reverse video shows plain");
+        assert_eq!((cell(8).0, cell(8).1.unwrap_or(t.bg)), (t.fg, t.bg), "past the selection nothing changes");
     }
 
     #[test]
