@@ -554,7 +554,10 @@ The main ones:
   with no terminal holding keyboard focus, they use the focused pane or block.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. Programs that track the mouse still get their mouse events
-  (hold Shift to select text instead). A drag stays with the terminal where it
+  (hold Shift to select text instead). Shift+click grows the terminal's selection
+  to the click, keeping all it had (scroll in between, e.g. Shift+PageUp, to take in
+  several pages); by whole words or lines when it began with a double- or
+  triple-click. A drag stays with the terminal where it
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.

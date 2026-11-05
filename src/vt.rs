@@ -467,6 +467,9 @@ pub struct Vt {
     press: GhosttySelectionGestureEvent,
     drag: GhosttySelectionGestureEvent,
     release: GhosttySelectionGestureEvent,
+    /// What the last new selection was made of (cells, words by double-click, lines by
+    /// triple-click): Shift+click extends it by the same.
+    unit: GhosttySelectionGestureBehavior,
     /// The cursor, the kitty images and the colors as last drawn: changes to
     /// them don't mark the render state dirty.
     drawn: (CursorKey, u64, u64),
@@ -675,6 +678,7 @@ impl Vt {
                 press,
                 drag,
                 release,
+                unit: GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL,
                 drawn: Default::default(),
                 seen: HashMap::new(),
                 seen_with: (0, 0),
@@ -899,12 +903,7 @@ impl Vt {
     /// Applies the resulting selection; a plain click clears it.
     pub fn select(&mut self, step: Select, col: u16, row: u16, x: f32, y: f32, cell_w: f32, height: f32) {
         unsafe {
-            let mut r = GhosttyGridRef { size: std::mem::size_of::<GhosttyGridRef>(), ..Default::default() };
-            let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_VIEWPORT, ..Default::default() };
-            p.value.coordinate = GhosttyPointCoordinate { x: col.min(self.cols.saturating_sub(1)), y: row.min(self.rows.saturating_sub(1)) as u32 };
-            if ghostty_terminal_grid_ref(self.term, p, &mut r) != GHOSTTY_SUCCESS {
-                return;
-            }
+            let Some(r) = self.viewport_ref(col, row) else { return };
             // Ghostty takes the cell width as a whole number: at zoom a cell is
             // 9.75 px, and 9 put "the middle of a cell" in the wrong place, so
             // the highlight jumped between cells while dragging. Positions and
@@ -948,6 +947,88 @@ impl Vt {
                 }
                 _ => {}
             }
+            if matches!(step, Select::Press) {
+                let mut unit = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL;
+                let read = ghostty_selection_gesture_get(self.gesture, self.term, GHOSTTY_SELECTION_GESTURE_DATA_BEHAVIOR, &mut unit as *mut _ as *mut c_void);
+                self.unit = if read == GHOSTTY_SUCCESS { unit } else { GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL };
+            }
+        }
+    }
+
+    /// The cell at a viewport position (clamped to the grid), as Ghostty addresses it.
+    unsafe fn viewport_ref(&self, col: u16, row: u16) -> Option<GhosttyGridRef> {
+        unsafe {
+            let mut r = GhosttyGridRef { size: std::mem::size_of::<GhosttyGridRef>(), ..Default::default() };
+            let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_VIEWPORT, ..Default::default() };
+            p.value.coordinate = GhosttyPointCoordinate { x: col.min(self.cols.saturating_sub(1)), y: row.min(self.rows.saturating_sub(1)) as u32 };
+            (ghostty_terminal_grid_ref(self.term, p, &mut r) == GHOSTTY_SUCCESS).then_some(r)
+        }
+    }
+
+    /// Whether `a` comes before `b` (or is `b`) in the screen and its history.
+    unsafe fn precedes(&self, a: GhosttyGridRef, b: GhosttyGridRef) -> bool {
+        unsafe {
+            let pair = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start: a, end: b, rectangle: false };
+            let mut order = GHOSTTY_SELECTION_ORDER_FORWARD;
+            ghostty_terminal_selection_order(self.term, &pair, &mut order);
+            order == GHOSTTY_SELECTION_ORDER_FORWARD
+        }
+    }
+
+    /// `sel` with its endpoints top-left first.
+    unsafe fn forward(&self, sel: &GhosttySelection) -> GhosttySelection {
+        unsafe {
+            let mut out = *sel;
+            ghostty_terminal_selection_ordered(self.term, sel, GHOSTTY_SELECTION_ORDER_FORWARD, &mut out);
+            out
+        }
+    }
+
+    /// Shift+click: grows the selection to the cell at a viewport position, as VTE
+    /// terminals (Tilix, GNOME Terminal) and xterm do. The end nearer the click moves
+    /// there and the far one stays, so the selection keeps what it had and takes in
+    /// everything up to the click, history scrolled through in between included; a
+    /// click inside it moves its end. A selection made by double- or triple-click
+    /// grows by whole words or lines. Returns false when nothing is selected.
+    pub fn extend_selection(&mut self, col: u16, row: u16) -> bool {
+        unsafe {
+            let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+            if ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SELECTION, &mut sel as *mut _ as *mut c_void) != GHOSTTY_SUCCESS {
+                return false;
+            }
+            let Some(at) = self.viewport_ref(col, row) else { return false };
+            let bounds = self.forward(&sel);
+            let (anchor, forward) = if !self.precedes(bounds.start, at) {
+                (bounds.end, false)
+            } else if self.precedes(bounds.end, at) {
+                (bounds.start, true)
+            } else {
+                (sel.start, self.precedes(sel.start, at))
+            };
+            // The moving end, on the far side of the word or line under the click.
+            let mut unit = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+            let found = match self.unit {
+                GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD => {
+                    let o = GhosttyTerminalSelectWordOptions { size: std::mem::size_of::<GhosttyTerminalSelectWordOptions>(), ref_: at, ..Default::default() };
+                    ghostty_terminal_select_word(self.term, &o, &mut unit) == GHOSTTY_SUCCESS
+                }
+                GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE => {
+                    let o = GhosttyTerminalSelectLineOptions { size: std::mem::size_of::<GhosttyTerminalSelectLineOptions>(), ref_: at, ..Default::default() };
+                    ghostty_terminal_select_line(self.term, &o, &mut unit) == GHOSTTY_SUCCESS
+                }
+                _ => false,
+            };
+            let end = if found {
+                let u = self.forward(&unit);
+                if forward { u.end } else { u.start }
+            } else {
+                at
+            };
+            let grown = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start: anchor, end, rectangle: sel.rectangle };
+            ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &grown as *const _ as *const c_void);
+            // The next plain click starts a gesture of its own, not a double-click of the old one.
+            ghostty_selection_gesture_reset(self.gesture, self.term);
+            true
         }
     }
 
@@ -1778,6 +1859,62 @@ mod tests {
         vt.write(b"\x1b[?1002h\x1b[?1006h");
         // Ghostty trusts the event's button even if this pane never saw a press.
         assert_eq!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, Some(GHOSTTY_MOUSE_BUTTON_LEFT), 0, 35.0, 5.0, (80, 2, 10.0, 20.0), false), b"\x1b[<32;4;1M");
+    }
+
+    #[test]
+    fn shift_click_grows_a_selection_across_scrolled_history() {
+        let mut vt = Vt::new(20, 3);
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        vt.write(lines.join("\r\n").as_bytes());
+        // Lines 7 to 9 are on screen: drag over "line 7".
+        vt.select(Select::Press, 0, 0, 2.0, 5.0, 10.0, 60.0);
+        vt.select(Select::Drag, 5, 0, 56.0, 5.0, 10.0, 60.0);
+        vt.select(Select::Release, 5, 0, 56.0, 5.0, 10.0, 60.0);
+        assert_eq!(vt.selection_text().as_deref(), Some("line 7"));
+        // Five lines up (lines 2 to 4 on screen), Shift+click on line 2's "e": the
+        // selection keeps "line 7" and takes in everything up to the click.
+        vt.scroll_viewport(-5);
+        assert!(vt.extend_selection(3, 0));
+        assert_eq!(vt.selection_text().as_deref(), Some("e 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
+        // Back at the bottom, a Shift+click past it moves the other end; the top stays.
+        vt.scroll_to_bottom();
+        assert!(vt.extend_selection(5, 2));
+        assert_eq!(vt.selection_text().as_deref(), Some("e 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9"));
+        // A Shift+click inside it moves its end back.
+        assert!(vt.extend_selection(5, 0));
+        assert_eq!(vt.selection_text().as_deref(), Some("e 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
+    }
+
+    #[test]
+    fn shift_click_with_nothing_selected_extends_nothing() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"hello world");
+        assert!(!vt.extend_selection(3, 0));
+        assert_eq!(vt.selection_text(), None);
+    }
+
+    #[test]
+    fn shift_click_grows_a_double_click_by_words_and_a_triple_click_by_lines() {
+        let mut vt = Vt::new(30, 3);
+        vt.write(b"alpha beta gamma\r\nsecond line\r\nthird line");
+        for _ in 0..2 {
+            vt.select(Select::Press, 7, 0, 72.0, 5.0, 10.0, 60.0);
+            vt.select(Select::Release, 7, 0, 72.0, 5.0, 10.0, 60.0);
+        }
+        assert_eq!(vt.selection_text().as_deref(), Some("beta"));
+        assert!(vt.extend_selection(12, 0));
+        assert_eq!(vt.selection_text().as_deref(), Some("beta gamma"));
+        assert!(vt.extend_selection(1, 0));
+        assert_eq!(vt.selection_text().as_deref(), Some("alpha beta gamma"));
+
+        vt.clear_selection();
+        for _ in 0..3 {
+            vt.select(Select::Press, 2, 1, 25.0, 25.0, 10.0, 60.0);
+            vt.select(Select::Release, 2, 1, 25.0, 25.0, 10.0, 60.0);
+        }
+        assert_eq!(vt.selection_text().as_deref(), Some("second line"));
+        assert!(vt.extend_selection(1, 2));
+        assert_eq!(vt.selection_text().as_deref(), Some("second line\nthird line"));
     }
 
     #[test]

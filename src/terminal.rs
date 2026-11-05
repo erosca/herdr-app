@@ -96,6 +96,8 @@ pub struct TerminalView {
     pub lost: bool,
     /// A left-button selection drag is in progress.
     selecting: bool,
+    /// This press (Shift+click) grows the selection there was rather than starting one.
+    extending: bool,
     selection_pointer: Point<Pixels>,
     selection_scroll: Option<Task<()>>,
     /// The terminal's folder, for links to relative paths.
@@ -193,6 +195,7 @@ impl TerminalView {
             ended: None,
             lost: false,
             selecting: false,
+            extending: false,
             selection_pointer: Point::default(),
             selection_scroll: None,
             cwd: None,
@@ -687,10 +690,19 @@ impl TerminalView {
         Some((target, hit.spans))
     }
 
-    fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    /// A left press where the program doesn't take the mouse. With Shift and
+    /// something selected, it grows that selection to here (scroll with
+    /// Shift+PageUp/PageDown in between to take in several pages), as in VTE
+    /// terminals and xterm; otherwise a new selection starts.
+    fn start_selection(&mut self, pos: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
         self.selecting = true;
         self.selection_pointer = pos;
-        self.select(Select::Press, pos, cx);
+        self.extending = shift && self.extend_selection(pos);
+        if self.extending {
+            cx.notify();
+        } else {
+            self.select(Select::Press, pos, cx);
+        }
         self.selection_scroll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(50)).await;
@@ -722,14 +734,36 @@ impl TerminalView {
         if let Some(pos) = pos {
             drop(g);
             self.select(Select::Release, pos, cx);
-        } else {
+        } else if !self.extending {
+            // A drag cut short drops what it began; one that grew a selection keeps it.
             g.vt.clear_selection();
             cx.notify();
         }
+        self.extending = false;
+    }
+
+    /// Grows the selection to the cell under `pos`; false when nothing is selected.
+    fn extend_selection(&mut self, pos: Point<Pixels>) -> bool {
+        let mut g = self.grid.borrow_mut();
+        let (x, y) = local(&g, pos);
+        let (col, row) = ((x / f32::from(g.cell.width)) as u16, (y / f32::from(g.cell.height)) as u16);
+        g.vt.extend_selection(col, row)
     }
 
     /// Selecting with the mouse (when the program doesn't take it).
     fn select(&mut self, step: Select, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.extending {
+            // Dragging after a Shift+click keeps growing the same selection.
+            let grown = self.extend_selection(pos);
+            if matches!(step, Select::Release) {
+                self.extending = false;
+                if grown {
+                    self.copy(cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         let mut g = self.grid.borrow_mut();
         let (x, y) = local(&g, pos);
         let (cw, ch) = (f32::from(g.cell.width), f32::from(g.cell.height));
@@ -1451,7 +1485,7 @@ impl Render for TerminalView {
                     return;
                 }
                 if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
-                    this.start_selection(ev.position, cx);
+                    this.start_selection(ev.position, ev.modifiers.shift, cx);
                 }
             }))
             // Right-click is Herdr's menu, even when the program tracks the mouse
