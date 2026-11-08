@@ -341,15 +341,12 @@ The tab block says how each pane of the shown tab is wrapped:
 { "tab": "active",
   "pane": { "gap": 6, "radius": 6, "background": "surface",
             "border": { "width": 1, "color": "border" }, "focus": { "width": 1, "color": "accent" },
-            "hover": { "width": 1, "color": "muted" },
             "header": { "content": { "mod": "pane" }, "height": 30, "position": "top", "reveal": "always" },
             "lone": false } }
 ```
 
 - The look applies to every pane; `focus` replaces the border while the
-  pane has the keyboard, `hover` while the pointer is over another pane (a
-  width equal to `border`'s keeps the content from moving); `gap` is the
-  space between panes.
+  pane has the keyboard; `gap` is the space between panes.
 - `header`: a mod drawn on each pane, one copy per pane, with
   `props().pane` and `props().terminal`. It reads its live facts from
   `panes()` (title, folder, branch, agent status, focused, zoomed) and its

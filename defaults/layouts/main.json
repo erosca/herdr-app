@@ -121,10 +121,6 @@
                     "width": 1,
                     "color": "accent"
                   },
-                  "hover": {
-                    "width": 1,
-                    "color": "#f5790099"
-                  },
                   "header": {
                     "content": {
                       "mod": "pane"

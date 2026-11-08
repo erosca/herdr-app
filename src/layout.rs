@@ -259,9 +259,6 @@ pub struct PaneFrame {
     /// The border while the pane has focus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<Line>,
-    /// The border while the pointer is over a pane that hasn't focus.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hover: Option<Line>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<f32>,
     /// Space between panes.
@@ -730,24 +727,6 @@ pub fn snap(x: f32, y: f32, w: f32, h: f32) -> (Edge, Align) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn panes_take_a_hover_border_and_main_ships_one() {
-        let frame: super::PaneFrame = serde_json::from_str(r#"{ "hover": { "color": "muted" } }"#).unwrap();
-        let hover = frame.hover.as_ref().unwrap();
-        assert_eq!((hover.width, hover.color.as_str()), (1.0, "muted"));
-        assert_eq!(serde_json::to_value(&frame).unwrap(), serde_json::json!({ "hover": { "width": 1.0, "color": "muted" } }));
-        assert!(serde_json::to_value(super::PaneFrame::default()).unwrap().get("hover").is_none());
-        fn hover_color(v: &serde_json::Value) -> Option<&str> {
-            match v {
-                serde_json::Value::Object(m) => m.get("hover").and_then(|h| h["color"].as_str()).or_else(|| m.values().find_map(hover_color)),
-                serde_json::Value::Array(a) => a.iter().find_map(hover_color),
-                _ => None,
-            }
-        }
-        let main: serde_json::Value = serde_json::from_str(include_str!("../defaults/layouts/main.json")).unwrap();
-        assert_eq!(hover_color(&main), Some("#f5790099"), "main.json frames hovered panes in dimmed orange");
-    }
-
     use super::*;
 
     #[test]
