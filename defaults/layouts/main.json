@@ -121,6 +121,10 @@
                     "width": 1,
                     "color": "accent"
                   },
+                  "hover": {
+                    "width": 1,
+                    "color": "muted"
+                  },
                   "header": {
                     "content": {
                       "mod": "pane"
