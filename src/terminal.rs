@@ -601,28 +601,13 @@ impl TerminalView {
         if n == 0 {
             return;
         }
-        let up = steps > 0;
-        if g.vt.mouse_tracking() {
-            let ((x, y), size) = mouse_at(&g, ev.position);
-            let button = if up { GHOSTTY_MOUSE_BUTTON_FOUR } else { GHOSTTY_MOUSE_BUTTON_FIVE };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
-            }
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
-        } else if g.vt.alt_screen() {
-            let key = if up { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_key(key, 0, 0, None, None));
-            }
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
-        } else {
-            g.vt.scroll_viewport(if up { -(n as isize) } else { n as isize });
+        // To the program (reported, or arrow keys on the alternate screen), which
+        // also clears a Shift selection; or Herdr's own history.
+        let ((x, y), size) = mouse_at(&g, ev.position);
+        if let Some(out) = g.vt.wheel(steps > 0, n, x, y, size)
+            && let Some(ch) = g.channel
+        {
+            g.core.input(ch, &out);
         }
         cx.notify();
     }

@@ -554,7 +554,9 @@ The main ones:
   with no terminal holding keyboard focus, they use the focused pane or block.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. Programs that track the mouse still get their mouse events
-  (hold Shift to select text instead). Shift+click grows the terminal's selection
+  (hold Shift to select text instead; the wheel still goes to the program and
+  clears that selection, as the program redraws under it, while scrolling a
+  shell's history keeps it). Shift+click grows the terminal's selection
   to the click, keeping all it had (scroll in between, e.g. Shift+PageUp, to take in
   several pages); by whole words or lines when it began with a double- or
   triple-click. A drag stays with the terminal where it

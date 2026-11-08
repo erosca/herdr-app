@@ -1311,6 +1311,32 @@ impl Vt {
         self.get_bool(GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING)
     }
 
+    /// The mouse wheel, `n` steps up or down. A program that tracks the mouse gets
+    /// it reported, and on the alternate screen (a pager, an editor) it becomes arrow
+    /// keys: those are the bytes returned. Otherwise Herdr's own history scrolls and
+    /// there is nothing to send. A wheel the program gets clears the terminal's
+    /// selection, as in Ghostty and VTE terminals: the program redraws other text where
+    /// it was (only Shift could make it there). History scrolling keeps it on its text.
+    pub fn wheel(&mut self, up: bool, n: usize, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.mouse_tracking() {
+            let button = if up { GHOSTTY_MOUSE_BUTTON_FOUR } else { GHOSTTY_MOUSE_BUTTON_FIVE };
+            for _ in 0..n {
+                out.extend(self.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
+            }
+        } else if self.alt_screen() {
+            let key = if up { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
+            for _ in 0..n {
+                out.extend(self.encode_key(key, 0, 0, None, None));
+            }
+        } else {
+            self.scroll_viewport(if up { -(n as isize) } else { n as isize });
+            return None;
+        }
+        self.clear_selection();
+        Some(out)
+    }
+
     pub fn alt_screen(&self) -> bool {
         let mut screen: GhosttyTerminalScreen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
         unsafe { ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &mut screen as *mut _ as *mut c_void) };
@@ -1953,6 +1979,40 @@ mod tests {
         assert_eq!(cell(3), (t.bg, Some(t.fg)), "a blank between words too");
         assert_eq!(cell(4), (t.fg, Some(t.bg)), "reverse video shows plain");
         assert_eq!((cell(8).0, cell(8).1.unwrap_or(t.bg)), (t.fg, t.bg), "past the selection nothing changes");
+    }
+
+    #[test]
+    fn a_wheel_the_program_gets_clears_the_selection_and_history_scrolling_keeps_it() {
+        let size = (20, 3, 10.0, 20.0);
+        let select_hello = |vt: &mut Vt| {
+            vt.select(Select::Press, 0, 0, 2.0, 5.0, 10.0, 60.0);
+            vt.select(Select::Drag, 4, 0, 46.0, 5.0, 10.0, 60.0);
+            vt.select(Select::Release, 4, 0, 46.0, 5.0, 10.0, 60.0);
+            assert_eq!(vt.selection_text().as_deref(), Some("hello"));
+        };
+
+        // A shell: the wheel scrolls Herdr's history and the selection stays on its text.
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"hello\r\nline 1\r\nline 2");
+        select_hello(&mut vt);
+        assert_eq!(vt.wheel(true, 1, 5.0, 5.0, size), None);
+        assert_eq!(vt.selection_text().as_deref(), Some("hello"));
+
+        // vim with the mouse on: the wheel is reported to it, which redraws under the
+        // selection (made with Shift), so the selection goes.
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[Hhello");
+        select_hello(&mut vt);
+        let sent = vt.wheel(false, 1, 5.0, 5.0, size).expect("reported to the program");
+        assert!(sent.starts_with(b"\x1b[<"), "{:?}", String::from_utf8_lossy(&sent));
+        assert_eq!(vt.selection_text(), None);
+
+        // A pager on the alternate screen without the mouse: arrow keys, same rule.
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"\x1b[?1049h\x1b[Hhello");
+        select_hello(&mut vt);
+        assert_eq!(vt.wheel(true, 2, 5.0, 5.0, size).as_deref(), Some(&b"\x1b[A\x1b[A"[..]));
+        assert_eq!(vt.selection_text(), None);
     }
 
     #[test]
