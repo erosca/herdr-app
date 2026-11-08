@@ -3683,12 +3683,15 @@ impl AppWindow {
         if let Some(l) = line {
             el = el.border(settings::z(l.width)).border_color(c(&l.color));
         }
+        el = shadow(el, f.shadow.as_deref());
         // The pointer over a pane that hasn't focus: GPUI swaps in its hover border.
+        // The id keeps the hover state GPUI redraws by when the pointer moves from
+        // pane to pane; without one the border showed only when something else redrew.
+        let mut el = el.id(SharedString::from(format!("pane-frame-{}", n.id)));
         if let Some(h) = f.hover.as_ref().filter(|_| !on) {
             let (width, color) = (settings::z(h.width), c(&h.color));
             el = el.hover(move |s| s.border(width).border_color(color));
         }
-        el = shadow(el, f.shadow.as_deref());
         let body = div().flex_1().min_h_0().flex().child(inner);
         let Some(h) = &f.header else { return el.child(body).into_any_element() };
         let head = div().flex_none().h(settings::z(h.height.unwrap_or(HEADER_HEIGHT))).w_full().flex()
