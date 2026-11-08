@@ -556,10 +556,12 @@ The main ones:
   releasing stops it. Programs that track the mouse still get their mouse events
   (hold Shift to select text instead; the wheel still goes to the program and
   clears that selection, as the program redraws under it, while scrolling a
-  shell's history keeps it). Shift+click grows the terminal's selection
-  to the click, keeping all it had (scroll in between, e.g. Shift+PageUp, to take in
-  several pages); by whole words or lines when it began with a double- or
-  triple-click. A drag stays with the terminal where it
+  shell's history keeps it). Where the program leaves the mouse to Herdr (a shell),
+  Shift+click grows the terminal's selection to the click, keeping all it had
+  (scroll in between, e.g. Shift+PageUp, to take in several pages); by whole words
+  or lines when it began with a double- or triple-click. In a program that takes
+  the mouse, Shift is what takes it back, so each Shift+click or Shift+drag starts
+  a new selection. A drag stays with the terminal where it
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
