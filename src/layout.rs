@@ -745,7 +745,7 @@ mod tests {
             }
         }
         let main: serde_json::Value = serde_json::from_str(include_str!("../defaults/layouts/main.json")).unwrap();
-        assert_eq!(hover_color(&main), Some("#f5790066"), "main.json frames hovered panes in dimmed orange");
+        assert_eq!(hover_color(&main), Some("#f5790099"), "main.json frames hovered panes in dimmed orange");
     }
 
     use super::*;
