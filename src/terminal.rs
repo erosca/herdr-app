@@ -1001,7 +1001,7 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     let text = match k.key.as_str() {
         "space" => Some(" ".to_owned()),
-        _ => k.key_char.clone(),
+        _ => k.key_char.clone().or_else(|| ctrl_text(k)),
     };
     // macOS translates Option into text unless it is configured as Alt.
     // That text can be ASCII too (Slovenian Shift-Option-2 -> "@").
@@ -1017,6 +1017,22 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
         consumed |= GHOSTTY_MODS_ALT as GhosttyMods;
     }
     Some(vt.encode_key(key, mods, consumed, text.as_deref(), unshifted))
+}
+
+/// The character under Ctrl, which libghostty wants as the key's text ("n" for
+/// Ctrl+N; it encodes Ctrl itself), as Ghostty gives it. GPUI drops the text when
+/// Ctrl turns it into a control code. Without it, in xterm's modifyOtherKeys
+/// (vim asks for it), Ctrl+letters went as bare control codes while other
+/// modified keys went as sequences. Once vim has seen a sequence it only matches
+/// mappings in that form, so `<C-N><C-N>` stopped working after a while. Bytes
+/// outside that mode are the same either way. Shift combinations are left as they
+/// were: with text, libghostty would send them as CSI u, which shells don't read.
+fn ctrl_text(k: &Keystroke) -> Option<String> {
+    let mut chars = k.key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if k.modifiers.control && !k.modifiers.shift && c.is_ascii_graphic() => Some(c.to_string()),
+        _ => None,
+    }
 }
 
 fn map_key(key: &str) -> Option<(GhosttyKey, bool, Option<char>)> {
@@ -1989,6 +2005,23 @@ mod tests {
             }
             assert_eq!(key_bytes(&mut vt, &press("alt-left", None)).unwrap(), b"\x1b[1;3D");
         }
+    }
+
+    /// vim asks for xterm's modifyOtherKeys (TERM=xterm-*). Once it has seen a key
+    /// as a CSI 27 sequence (Shift+Enter is one in any mode), it matches mappings
+    /// only in that form: `<C-N><C-N>` broke while Ctrl+N still came as a control
+    /// code. In that mode every modified key is a sequence, as in xterm and Ghostty.
+    #[test]
+    fn ctrl_keys_come_as_sequences_where_the_program_asked_for_modify_other_keys() {
+        let mut vt = Vt::new(20, 3);
+        let send = |vt: &mut Vt, spec| key_bytes(vt, &press(spec, None)).unwrap();
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x0e", "a shell: the control code");
+        assert_eq!(send(&mut vt, "ctrl-["), b"\x1b");
+        vt.write(b"\x1b[>4;2m");
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x1b[27;5;110~");
+        assert_eq!(send(&mut vt, "shift-enter"), b"\x1b[27;2;13~");
+        vt.write(b"\x1b[>4m");
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x0e", "vim gone: the control code again");
     }
 
     #[test]
