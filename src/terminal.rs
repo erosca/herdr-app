@@ -115,6 +115,8 @@ pub struct TerminalView {
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: f32,
+    /// Lines scrolled toward the next wheel report to a program (`wheel_reports`).
+    wheel_lines: i32,
     _reader: Option<Task<()>>,
 }
 
@@ -224,6 +226,7 @@ impl TerminalView {
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
             scrolled: 0.0,
+            wheel_lines: 0,
             _reader: None,
         };
         view.connect(core, false, cx);
@@ -604,10 +607,12 @@ impl TerminalView {
         if n == 0 {
             return;
         }
+        let reports = wheel_reports(&mut self.wheel_lines, steps).unsigned_abs() as usize;
         // To the program (reported, or arrow keys on the alternate screen), which
         // also clears a Shift selection; or Herdr's own history.
         let ((x, y), size) = mouse_at(&g, ev.position);
-        if let Some(out) = g.vt.wheel(steps > 0, n, x, y, size)
+        if let Some(out) = g.vt.wheel(steps > 0, n, reports, x, y, size)
+            && !out.is_empty()
             && let Some(ch) = g.channel
         {
             g.core.input(ch, &out);
@@ -877,6 +882,24 @@ fn scroll_steps(scrolled: &mut f32, phase: TouchPhase, lines: f32, rows: f32) ->
         }
         _ => 0,
     }
+}
+
+/// Lines one wheel notch scrolls: GPUI's on Linux, Ghostty's on macOS, Windows'
+/// default.
+const NOTCH_LINES: i32 = 3;
+
+/// Wheel reports for a program that tracks the mouse, from lines scrolled: one a
+/// notch, as VTE terminals (Tilix, GNOME Terminal) send them. vim scrolls 3 lines
+/// a report, so a report a line scrolled it 9 a notch. A touchpad's lines add up
+/// to a notch first; turning back starts again.
+fn wheel_reports(toward: &mut i32, lines: i32) -> i32 {
+    if toward.signum() * lines.signum() < 0 {
+        *toward = 0;
+    }
+    *toward += lines;
+    let reports = *toward / NOTCH_LINES;
+    *toward -= reports * NOTCH_LINES;
+    reports
 }
 
 /// Lines for a macOS mouse wheel event, as Ghostty scrolls them. macOS reports
@@ -1661,6 +1684,21 @@ impl Scroll {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_program_gets_one_wheel_report_a_notch() {
+        let mut toward = 0;
+        assert_eq!(super::wheel_reports(&mut toward, 3), 1, "a mouse notch");
+        assert_eq!(super::wheel_reports(&mut toward, -6), -2, "two notches back");
+        // A touchpad's lines add up to a notch.
+        assert_eq!(super::wheel_reports(&mut toward, 1), 0);
+        assert_eq!(super::wheel_reports(&mut toward, 1), 0);
+        assert_eq!(super::wheel_reports(&mut toward, 1), 1);
+        // Turning back starts from nothing.
+        assert_eq!(super::wheel_reports(&mut toward, 2), 0);
+        assert_eq!(super::wheel_reports(&mut toward, -2), 0);
+        assert_eq!(super::wheel_reports(&mut toward, -1), -1);
+    }
+
     #[test]
     fn the_scroll_thumb_shows_where_the_view_is_and_hides_at_the_bottom() {
         let thumb = |rows, min| super::scroll_thumb(rows, (10.0, 100.0), min);
