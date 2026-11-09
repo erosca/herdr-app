@@ -6,5 +6,6 @@
   "appearance": "dark",
   "minimum_contrast": 1,
   "invert_selection": true,
-  "bold_is_bright": true
+  "bold_is_bright": true,
+  "scrollback_lines": 100000
 }

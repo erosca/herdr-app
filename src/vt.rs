@@ -63,6 +63,8 @@ pub struct Theme {
     pub invert_selection: bool,
     /// Bold text in palette colors 0-7 is drawn in 8-15 (settings.json `bold_is_bright`).
     pub bold_is_bright: bool,
+    /// Lines and bytes of history kept (settings.json `scrollback_lines`).
+    pub scrollback: (usize, usize),
 }
 
 /// The terminal colors from settings.json's theme.
@@ -84,6 +86,7 @@ pub fn theme() -> Theme {
         minimum_contrast: s.minimum_contrast,
         invert_selection: s.invert_selection,
         bold_is_bright: s.bold_is_bright,
+        scrollback: s.scrollback(),
     }
 }
 
@@ -612,9 +615,6 @@ unsafe extern "C" fn on_title(_t: GhosttyTerminal, userdata: *mut c_void) {
 const SYNC_OUTPUT: GhosttyMode = 2026;
 const BRACKETED_PASTE: GhosttyMode = 2004;
 const MAX_HOLD: Duration = Duration::from_millis(1000);
-const SCROLLBACK_MAX_LINES: usize = 10_000;
-// Bound memory per terminal; wide or heavily styled rows may hit this first.
-const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
 /// Units per pixel for selection gestures (see `select`).
 const SUBPIXEL: f32 = 64.0;
 
@@ -660,8 +660,6 @@ impl Vt {
             let mut colors = GhosttyRenderStateColors { size: std::mem::size_of::<GhosttyRenderStateColors>(), ..Default::default() };
             ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &mut colors as *mut _ as *mut c_void);
 
-            ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &SCROLLBACK_MAX_BYTES as *const _ as *const c_void), "scrollback_max_bytes");
-            ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &SCROLLBACK_MAX_LINES as *const _ as *const c_void), "scrollback_max_lines");
 
             let mut gesture = std::ptr::null_mut();
             ok(ghostty_selection_gesture_new(std::ptr::null(), &mut gesture), "selection_gesture_new");
@@ -728,6 +726,10 @@ impl Vt {
             ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg as *const _ as *const c_void);
             ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cur as *const _ as *const c_void);
             ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, &palette as *const _ as *const c_void);
+            // History bounds memory per terminal; a lower limit drops the oldest lines at once.
+            let (lines, bytes) = t.scrollback;
+            ok(ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes as *const _ as *const c_void), "scrollback_max_bytes");
+            ok(ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines as *const _ as *const c_void), "scrollback_max_lines");
         }
     }
 
@@ -1689,6 +1691,23 @@ impl Drop for Vt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrollback_follows_the_setting_and_lowering_it_drops_the_oldest_lines() {
+        let first_line = |vt: &mut Vt| {
+            vt.scroll_viewport(-10_000_000);
+            vt.frame().rows[0].iter().map(|c| c.text.as_str()).collect::<String>()
+        };
+        let mut vt = Vt::new(80, 25);
+        vt.set_theme(Theme { scrollback: (30_000, 60_000_000), ..theme() });
+        for line in 1..=20_000 {
+            vt.write(format!("{line:05}\r\n").as_bytes());
+        }
+        assert!(first_line(&mut vt).starts_with("00001"), "all 20,000 lines kept");
+        // Back to Herdr's 10,000: the oldest lines go at once.
+        vt.set_theme(theme());
+        assert!(!first_line(&mut vt).starts_with("00001"));
+    }
 
     #[test]
     fn scrollback_retains_five_thousand_styled_lines() {

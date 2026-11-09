@@ -29,7 +29,7 @@ import sys
 import time
 
 BUILT_IN_THEMES = {"graphite", "ink", "moss", "paper"}
-LOOK_SETTINGS = ["theme", "font", "font_size", "ui_font", "zoom", "colors", "appearance", "minimum_contrast", "invert_selection", "bold_is_bright"]
+LOOK_SETTINGS = ["theme", "font", "font_size", "ui_font", "zoom", "colors", "appearance", "minimum_contrast", "invert_selection", "bold_is_bright", "scrollback_lines"]
 
 
 def load(path, default=None):

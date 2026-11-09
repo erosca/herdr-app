@@ -397,6 +397,9 @@ pub struct Person {
     /// counterparts (VTE's "Show bold text in bright colors").
     #[serde(skip_serializing_if = "is_false")]
     pub bold_is_bright: bool,
+    /// Lines of history each terminal keeps (unset: Herdr's 10,000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrollback_lines: Option<usize>,
     /// macOS Option sends Alt shortcuts, or follows the keyboard layout.
     #[serde(skip_serializing_if = "OptionAsAlt::is_auto")]
     pub option_as_alt: OptionAsAlt,
@@ -461,6 +464,7 @@ impl Default for Person {
             minimum_contrast: 1.0,
             invert_selection: false,
             bold_is_bright: false,
+            scrollback_lines: None,
             option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
             theme: None,
@@ -497,6 +501,7 @@ pub struct Settings {
     pub minimum_contrast: f32,
     pub invert_selection: bool,
     pub bold_is_bright: bool,
+    pub scrollback_lines: Option<usize>,
     pub option_as_alt: OptionAsAlt,
     pub sounds: Sounds,
 }
@@ -539,6 +544,7 @@ impl Default for Settings {
             minimum_contrast: 1.0,
             invert_selection: false,
             bold_is_bright: false,
+            scrollback_lines: None,
             option_as_alt: OptionAsAlt::Auto,
             sounds: Sounds::default(),
         }
@@ -578,6 +584,7 @@ impl Settings {
             minimum_contrast: person.minimum_contrast,
             invert_selection: person.invert_selection,
             bold_is_bright: person.bold_is_bright,
+            scrollback_lines: person.scrollback_lines,
             option_as_alt: person.option_as_alt,
         }
     }
@@ -629,9 +636,33 @@ impl Settings {
         if !(6.0..=72.0).contains(&self.font_size) {
             out.push(format!("font_size {} is outside 6..72", self.font_size));
         }
+        if let Some(n) = self.scrollback_lines.filter(|n| *n > MAX_SCROLLBACK_LINES) {
+            out.push(format!("scrollback_lines {n} is above {MAX_SCROLLBACK_LINES}"));
+        }
         out
     }
+
+    /// Lines and bytes of history a terminal keeps (libghostty stops at whichever
+    /// comes first): Herdr's 10,000 lines in at most 10 MB, or `scrollback_lines`
+    /// with about 2 KB a line, so wide and colorful rows still get the lines asked for.
+    pub fn scrollback(&self) -> (usize, usize) {
+        match self.scrollback_lines {
+            None => (10_000, 10_000_000),
+            Some(n) => {
+                let n = n.min(MAX_SCROLLBACK_LINES);
+                (n, n * 2_000)
+            }
+        }
+    }
+
+    /// How many lines of history to ask the core for when attaching to a terminal.
+    pub fn attach_history(&self) -> usize {
+        self.scrollback_lines.map_or(2_000, |n| n.min(MAX_SCROLLBACK_LINES))
+    }
 }
+
+/// The most `scrollback_lines` may ask for: about 2 GB of history a terminal.
+pub const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
 pub fn path() -> std::path::PathBuf {
     crate::mods::app_dir().join("settings.json")
@@ -917,6 +948,20 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_keeps_herdrs_default_until_set_and_scales_memory_with_lines() {
+        let default = Settings::default();
+        assert_eq!((default.scrollback(), default.attach_history()), ((10_000, 10_000_000), 2_000));
+        assert!(serde_json::to_value(Person::default()).unwrap().get("scrollback_lines").is_none());
+        for (n, ok) in [(100_000, true), (MAX_SCROLLBACK_LINES, true), (MAX_SCROLLBACK_LINES + 1, false)] {
+            let person: Person = serde_json::from_value(serde_json::json!({"scrollback_lines": n})).unwrap();
+            let s = Settings::compose(&person, &crate::layout::Look::default(), true);
+            let kept = n.min(MAX_SCROLLBACK_LINES);
+            assert_eq!((s.scrollback(), s.attach_history()), ((kept, kept * 2_000), kept));
+            assert_eq!(s.problems().is_empty(), ok, "{n}");
+        }
+    }
+
+    #[test]
     fn program_clipboard_writes_default_on_and_can_be_disabled() {
         let default: Person = serde_json::from_str("{}").unwrap();
         assert!(default.clipboard_write);
@@ -950,7 +995,7 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, invert_selection: true, bold_is_bright: true, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, invert_selection: true, bold_is_bright: true, scrollback_lines: Some(1), appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();

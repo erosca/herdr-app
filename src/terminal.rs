@@ -267,7 +267,8 @@ impl TerminalView {
         let address = self.address.clone();
         // Replacing the task drops an attach still in flight for an older connection.
         self._reader = Some(cx.spawn(async move |this, cx| {
-            let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
+            let history = crate::settings::get().attach_history();
+            let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, history, facts) }).await;
             let Ok(Some(rx)) = this.update(cx, |this, cx| this.attached(attached, (cols, rows), announce_end, cx)) else {
                 return;
             };

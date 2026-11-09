@@ -682,6 +682,12 @@ What's about the user, never a look:
   colors in their bright counterparts (colors 8-15), as VTE terminals' "Show bold
   text in bright colors" does; plain text and backgrounds keep their colors.
   `false` (default) leaves colors as programs set them. Changes apply immediately.
+- `scrollback_lines`: lines of history each terminal keeps, up to `1000000`
+  (unset: 10000, in at most 10 MB). A set value allows about 2 KB of memory
+  a line. Herdr also asks the core for that many lines when it reopens a
+  terminal, after a restart; the core keeps its own history, which bounds what
+  comes back then. Changes apply immediately; lowering it drops the oldest
+  lines at once.
 - `clipboard_write`: `false` blocks terminal programs from writing the local
   clipboard (default `true`, including remote terminals attached in this window).
   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,
