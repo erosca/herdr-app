@@ -7,7 +7,9 @@
     "ctrl-shift-up": "pane.go:up",
     "ctrl-shift-down": "pane.go:down",
     "ctrl-shift-left": "pane.go:left",
-    "ctrl-shift-right": "pane.go:right"
+    "ctrl-shift-right": "pane.go:right",
+    "ctrl-left": "terminal",
+    "ctrl-right": "terminal"
   },
   "global": {
     "ctrl-shift-up": "pane.go:up",

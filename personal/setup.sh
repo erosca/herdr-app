@@ -193,11 +193,14 @@ else
     # A new ~/.inputrc replaces the system's, so it keeps those bindings (Home, End, ...).
     echo '$include /etc/inputrc' >"$inputrc"
   fi
-  { echo; grep '^#' "$here/inputrc"; printf '%s\n' "$missing"; } >>"$inputrc"
+  comments=$(grep '^#' "$here/inputrc" | while IFS= read -r line; do
+    grep -qxF -- "$line" "$inputrc" 2>/dev/null || printf '%s\n' "$line"
+  done)
+  { echo; [[ -n $comments ]] && printf '%s\n' "$comments"; printf '%s\n' "$missing"; } >>"$inputrc"
   echo "  wrote:     $inputrc"
   echo "Shells already open (Herdr keeps them across restarts) need: bind -f $inputrc"
 fi
-[[ ${SHELL##*/} == zsh ]] && echo "note: your shell is zsh; add to ~/.zshrc: bindkey '^[[27;2;13~' accept-line"
+[[ ${SHELL##*/} == zsh ]] && echo "note: your shell is zsh; add to ~/.zshrc: bindkey '^[[27;2;13~' accept-line '^[[1;5D' backward-word '^[[1;5C' forward-word"
 
 say "Done"
 echo "Quit Herdr completely and open it again to use the new build and settings."

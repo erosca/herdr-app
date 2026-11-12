@@ -61,11 +61,11 @@ itself to upstream's release.
 
 | File | Goes to | Notes |
 |---|---|---|
-| `keys.json` | merged into `keys.json` | Shift+Insert/Ctrl+Insert paste and copy, Shift+PageUp/PageDown scroll, Ctrl+Shift+arrows move between panes |
+| `keys.json` | merged into `keys.json` | Shift+Insert/Ctrl+Insert paste and copy, Shift+PageUp/PageDown scroll, Ctrl+Shift+arrows move between panes, Ctrl+Left/Right reach programs as in xterm (Herdr's default sends Alt+B/F, which takes vim out of Insert mode) |
 | `settings.json` | merged into `settings.json` | font, size, zoom, theme |
 | `themes/*.json` | copied to `themes/` | e.g. `tilix.json` |
 | `fonts/*` | copied to `fonts/` | for machines that lack the font |
-| `inputrc` | added to `~/.inputrc` (bash), when missing | Shift+Enter runs the command line instead of printing `;2;13~` |
+| `inputrc` | added to `~/.inputrc` (bash), when missing | Shift+Enter runs the command line instead of printing `;2;13~`; Ctrl+Left/Right move by word |
 | `bin/*` | `~/.local/bin/` | agents' programs, e.g. `dummy-agent` |
 | `hc-templates/*.md` | `~/.config/herdr-core/templates/` | agents `hc run` starts by name |
 | `programs.json` | merged into `programs.json` | agents' names and tiles in Herdr, and its menu of agents to start |
