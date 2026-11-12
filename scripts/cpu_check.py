@@ -8,8 +8,9 @@ Run it in the desktop session where Herdr is slow (e.g. NoMachine), with no
 build running. It opens a test window several times, one per setup below, each
 on its own temporary home and core session: your Herdr, its terminals and its
 settings are not touched (your settings.json, themes and fonts are copied so
-text looks the same). Keep the test window on screen, not minimized, while it
-runs: about 5 minutes in all.
+text looks the same). Keep the test window on screen, not minimized, and leave
+the keyboard and mouse alone while it runs: about 4 minutes in all. One setup
+shows the test window full screen for about half a minute.
 
 In each test window a terminal plays the same synthetic output:
 
@@ -21,22 +22,31 @@ In each test window a terminal plays the same synthetic output:
 
 and it measures herdr-app's CPU, the part of it in the software rasterizer's
 llvmpipe threads, the window's draws per second, the CPU each draw costs and
-how much of the main thread's share goes to building the frame. With Linux perf
+how much of the main thread's share goes to building the frame. Alongside, it
+measures the desktop that shows the window: this session's gnome-shell (the
+compositor, and how much of it runs in llvmpipe, software GL), its X server and
+NoMachine's processes, first with no test window (the baseline), then during
+every scenario. With Linux perf
 allowed (kernel.perf_event_paranoid 2 or lower), it also samples the main
 thread while the launcher setup scrolls: which functions that time goes to.
 
-Setups run by default (each opens a fresh test window):
+Setups run by default (round 4: what Herdr costs the compositor; each opens a
+fresh test window):
 
-  gpu          no backend forced (NVIDIA Vulkan here), Fifo present, no draw cap:
-               the reference
   launcher     what the NoMachine launcher sets (read from personal/herdr-app.in)
+  l-nocap      the same without the draw cap (HERDR_MAX_FPS)
+  l-cap10      the same, draws capped at 10 a second
+  l-quarter    the same, the window a quarter of the screen
+  l-full       the same, full screen (a compositor may skip a full-screen window)
 
-Earlier rounds' setups (--only to run them): gpu-imm, gpu-mailbox, gpu-yield
-(__GL_YIELD=USLEEP), cap30, cap20, cap15, cap10 (HERDR_MAX_FPS), gl (OpenGL on
-llvmpipe), gpu-30, gpu-20, now, nopartial, lp4, quarter, auto, vgl, nxvgl.
+Earlier rounds' setups (--only to run them): gpu (no backend forced, Fifo, no
+cap), gpu-imm, gpu-mailbox, gpu-yield (__GL_YIELD=USLEEP), cap30, cap20, cap15,
+cap10 (HERDR_MAX_FPS), gl (OpenGL on llvmpipe), gpu-30, gpu-20, now, nopartial,
+lp4, quarter, auto, vgl, nxvgl.
 
-The report holds numbers, GPU adapter names, the screen size and the CPU count:
-no paths, user or host names, terminal contents or environment. Everything
+The report holds numbers, GPU adapter names, the screen size, the CPU count and
+the names of the desktop's processes it measured (gnome-shell, Xorg, nx...): no
+paths, user or host names, terminal contents or environment. Everything
 the test windows wrote (homes, logs, counters) is deleted at the end.
 """
 
@@ -85,7 +95,9 @@ time.sleep(10 ** 7)
 
 NOW = {"HERDR_TEST_GPU_BACKEND": "gl", "HERDR_RENDER_PARTIAL": "cpu"}
 GPU = {"HERDR_RENDER_PARTIAL": "cpu"}
-DEFAULT = ["gpu", "launcher"]
+DEFAULT = ["launcher", "l-nocap", "l-cap10", "l-quarter", "l-full"]
+# An environment holding this key starts from the launcher's; a None value removes that variable.
+LAUNCHER = "@launcher"
 FIFO = dict(GPU, HERDR_TEST_PRESENT_MODE="fifo")  # Fifo is the default; naming it logs the modes there are
 # The setup and scenario whose main thread perf samples.
 PERF_AT = ("launcher", "scroll")
@@ -96,6 +108,13 @@ SETUPS = [
      ["idle", "scroll", "status", "hidden"]),
     # Its environment comes from personal/herdr-app.in when the run starts.
     ("launcher", "the NoMachine launcher's settings", None, None, "max", ["idle", "scroll", "status", "hidden"]),
+    ("l-nocap", "the launcher's settings without the draw cap", {LAUNCHER: "1", "HERDR_MAX_FPS": None}, None, "max",
+     ["scroll"]),
+    ("l-cap10", "the launcher's settings, draws capped at 10/s", {LAUNCHER: "1", "HERDR_MAX_FPS": "10"}, None, "max",
+     ["scroll"]),
+    ("l-quarter", "the launcher's settings, window 1/2 x 1/2 of the screen", {LAUNCHER: "1"}, None, "quarter",
+     ["scroll"]),
+    ("l-full", "the launcher's settings, full screen", {LAUNCHER: "1"}, None, "full", ["scroll"]),
     ("gpu-imm", "gpu, Immediate present", dict(GPU, HERDR_TEST_PRESENT_MODE="immediate"), None, "max",
      ["scroll", "status"]),
     ("gpu-mailbox", "gpu, Mailbox present", dict(GPU, HERDR_TEST_PRESENT_MODE="mailbox"), None, "max", ["scroll"]),
@@ -270,6 +289,84 @@ def nvidia_device():
     return None, False
 
 
+X_SERVERS = {"Xorg", "Xwayland", "X", "Xvfb", "Xvnc", "Xnest", "Xephyr", "nxagent"}
+
+
+def desktop_procs():
+    """The processes that show this desktop: this session's gnome-shell, the X server
+    of this DISPLAY (every X server when none matches), and all of NoMachine's.
+    Returns their pids by group, and the process names counted in each group."""
+    display = os.environ.get("DISPLAY", "").split(".")[0]
+    me = os.getuid()
+    shells, xs, nx = [], [], []
+    for e in os.scandir("/proc"):
+        if not e.name.isdigit():
+            continue
+        comm = (read(f"/proc/{e.name}/comm") or "").strip()
+        if comm == "gnome-shell":
+            try:
+                if os.stat(f"/proc/{e.name}").st_uid == me:
+                    shells.append(int(e.name))
+            except OSError:
+                pass
+        elif comm in X_SERVERS:
+            args = (read(f"/proc/{e.name}/cmdline") or "").split("\0")
+            xs.append((int(e.name), comm, bool(display) and display in args))
+        elif comm.startswith("nx"):
+            nx.append((int(e.name), comm))
+    if len(shells) > 1:
+        same = [p for p in shells if environ_of(p).get("DISPLAY", "").split(".")[0] == display]
+        shells = same or shells[:1]
+    mine = [(p, c) for p, c, match in xs if match]
+    xsel = mine or [(p, c) for p, c, _ in xs]
+    groups = {"shell": shells, "x": [p for p, _ in xsel], "nx": [p for p, _ in nx]}
+    names = {"shell": ["gnome-shell"] if shells else [],
+             "x": sorted({c for _, c in xsel}) + (["(this display)"] if mine else ["(all, none matched DISPLAY)"] if xsel else []),
+             "nx": sorted({c for _, c in nx})}
+    return groups, names
+
+
+def desk_ticks(groups):
+    """CPU ticks of each group, and of gnome-shell's llvmpipe (software GL) threads."""
+    out = {g: sum(ticks(f"/proc/{p}/stat") or 0 for p in pids) for g, pids in groups.items()}
+    lp = 0
+    for p in groups.get("shell", []):
+        try:
+            tids = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for t in tids:
+            if (read(f"/proc/{p}/task/{t}/comm") or "").startswith("llvmpipe"):
+                lp += ticks(f"/proc/{p}/task/{t}/stat") or 0
+    out["shell_lp"] = lp
+    return out
+
+
+def desk_pct(a, b, dt):
+    return {g: max(0, b.get(g, 0) - a.get(g, 0)) * 100.0 / CLK / dt for g in a}
+
+
+def shell_renderer(pids):
+    """How gnome-shell draws: llvmpipe threads mean software GL."""
+    if not pids:
+        return "no gnome-shell in this session"
+    p = pids[0]
+    maps = read(f"/proc/{p}/maps") or ""
+    try:
+        lp = sum(1 for t in os.listdir(f"/proc/{p}/task") if (read(f"/proc/{p}/task/{t}/comm") or "").startswith("llvmpipe"))
+    except OSError:
+        lp = 0
+    parts = []
+    if lp:
+        parts.append(f"llvmpipe, software GL ({lp} threads)")
+    if re.search(r"libnvidia-glcore|libGLX_nvidia|libEGL_nvidia", maps):
+        parts.append("NVIDIA's GL libraries loaded")
+    drivers = sorted(set(re.findall(r"/([a-z0-9]+)_dri\.so", maps)))
+    if drivers:
+        parts.append("Mesa driver files: " + ", ".join(drivers))
+    return "; ".join(parts) or "no llvmpipe threads, no NVIDIA or Mesa GL libraries found"
+
+
 def find_hc():
     for p in [shutil.which("hc"), os.path.expanduser("~/.local/bin/hc"), "/usr/local/bin/hc",
               os.path.expanduser("~/.cargo/bin/hc")]:
@@ -401,6 +498,9 @@ class Run:
         self.pid = None
         self.rows = {}
         self.info = {}
+        # Full screen: a compositor may stop compositing the window only after it has
+        # drawn the whole of it for a while (mutter counts such frames), so wait longer.
+        self.settle = 10.0 if self.window == "full" else SETTLE
 
     def env(self):
         c = self.ctx
@@ -435,8 +535,12 @@ class Run:
             json.dump({"frame.welcomed": True, "layout": "main"}, f)
         w, h, scale = c.screen or (1920, 1080, 1.0)
         lw, lh = w / scale, h / scale
-        place = ({"state": "windowed", "bounds": [0, 0, round(lw / 2), round(lh / 2)]} if self.window == "quarter"
-                 else {"state": "maximized", "bounds": [0, 0, round(lw * 0.6), round(lh * 0.6)]})
+        if self.window == "quarter":
+            place = {"state": "windowed", "bounds": [0, 0, round(lw / 2), round(lh / 2)]}
+        elif self.window == "full":
+            place = {"state": "fullscreen", "bounds": [0, 0, round(lw * 0.6), round(lh * 0.6)]}
+        else:
+            place = {"state": "maximized", "bounds": [0, 0, round(lw * 0.6), round(lh * 0.6)]}
         with open(os.path.join(self.home, "window.json"), "w") as f:
             json.dump(place, f)
 
@@ -521,10 +625,10 @@ class Run:
             pass
         frames = read(os.path.join(self.home, "frames.jsonl")) or ""
         return {"t": time.monotonic(), "app": ticks(f"/proc/{self.pid}/stat"), "threads": threads, "core": core,
-                "frames": len(frames.splitlines())}
+                "frames": len(frames.splitlines()), "desk": desk_ticks(self.ctx.desk)}
 
     def measure(self, scenario):
-        time.sleep(SETTLE)
+        time.sleep(self.settle)
         c = self.ctx
         raw = os.path.join(c.root, "perf.data")
         if c.perf and (self.name, scenario) == PERF_AT:
@@ -590,6 +694,7 @@ class Run:
             "build": per("frame_ms") / draws if draws >= 0.5 else None,
             "term": per("terminal"), "js": per("scripts"),
             "threads": [(g, pct(n)) for g, n in sorted(groups.items(), key=lambda x: -x[1])[:3] if n],
+            "desk": desk_pct(a["desk"], b["desk"], dt),
         }
 
     def play(self):
@@ -597,7 +702,7 @@ class Run:
         self.do("space.new", {"name": "cpu-check", "folder": c.root})
         for scenario in self.scenarios:
             say(f"  {self.name}: {scenario}")
-            secs = str(SETTLE + c.seconds + 2)
+            secs = str(self.settle + c.seconds + 2)
             if scenario == "idle":
                 pass
             elif scenario == "hidden":
@@ -668,6 +773,11 @@ def report(ctx, runs, skipped):
             if a not in adapters:
                 adapters.append(a)
     w("adapters found: " + ("; ".join(adapters) or "-"))
+    names = getattr(ctx, "desk_names", {})
+    w(f"desktop: {getattr(ctx, 'session_type', '?')} session; gnome-shell draws with: {getattr(ctx, 'shell_renderer', '?')}")
+    w("desktop processes measured: gnome-shell: " + (", ".join(names.get("shell", [])) or "none")
+      + "; X server: " + (" ".join(names.get("x", [])) or "none")
+      + "; NoMachine: " + (", ".join(names.get("nx", [])) or "none"))
     w("")
     head = (f"{'setup':11} {'scenario':8} {'app%':>6} {'llvmpipe%':>9} {'main%':>6} {'draws/s':>7} {'ms/draw':>7} "
             f"{'build':>6} {'term/s':>6} {'js/s':>5}  renderer")
@@ -858,7 +968,80 @@ def report(ctx, runs, skipped):
     if scrolls:
         best = min(scrolls)
         w(f"Lowest CPU while scrolling: {best[1]} ({best[0]:.0f}%)")
+    desktop_report(ctx, runs, w, row, verdict)
     return "\n".join(L) + "\n"
+
+
+def desktop_report(ctx, runs, w, row, verdict):
+    """Round 4: what each setup costs the desktop that shows the window."""
+    base = getattr(ctx, "baseline", None)
+    if not base or not any(r.rows for r in runs):
+        return
+    w("")
+    w("The desktop's CPU (% of one core) while each setup ran; extra = above the baseline (no test window)")
+    w(f"{'setup':11} {'scenario':8} {'draws/s':>7} {'herdr%':>6} {'shell%':>6} {'(llvmpipe)':>10} {'X%':>5} "
+      f"{'nx%':>5} {'shell ms/draw':>13} {'desktop ms/draw':>15}")
+    w(f"{'baseline':11} {'-':8} {'-':>7} {'-':>6} {base['shell']:6.0f} {base['shell_lp']:10.0f} {base['x']:5.0f} "
+      f"{base['nx']:5.0f}")
+
+    def per_draw(r, keys):
+        if not r or r["draws"] < 0.5:
+            return None
+        extra = sum(r["desk"][k] - base[k] for k in keys)
+        return max(0.0, extra) * 10 / r["draws"]
+
+    for r in runs:
+        for sc, x in r.rows.items():
+            if not x or "desk" not in x:
+                continue
+            d = x["desk"]
+            w(f"{r.name:11} {sc:8} {x['draws']:7.1f} {x['app']:6.0f} {d['shell']:6.0f} {d['shell_lp']:10.0f} "
+              f"{d['x']:5.0f} {d['nx']:5.0f} {fmt(per_draw(x, ['shell']), 1):>13} "
+              f"{fmt(per_draw(x, ['shell', 'x', 'nx']), 1):>15}")
+    w("shell ms/draw: gnome-shell's extra CPU per herdr-app window draw; desktop ms/draw: gnome-shell, X and NoMachine")
+    w("")
+    w("Hypotheses about the compositor (only those this run tested)")
+    sc, hid, idle = row("launcher", "scroll"), row("launcher", "hidden"), row("launcher", "idle")
+    extra = lambda x, k="shell": x["desk"][k] - base[k]
+    if sc and hid:
+        e, eh = extra(sc), extra(hid)
+        verdict("C1", e >= 10 and e - eh >= 0.5 * e,
+                f"gnome-shell's CPU follows herdr-app's draws: {sc['desk']['shell']:.0f}% while a build scrolls on screen"
+                f" ({sc['draws']:.0f} draws/s), {hid['desk']['shell']:.0f}% while it scrolls in a hidden tab,"
+                f" {base['shell']:.0f}% with no test window")
+        if e >= 10:
+            lp = sc["desk"]["shell_lp"] - base["shell_lp"]
+            verdict("C2", lp >= 0.5 * e,
+                    f"gnome-shell composites in software (llvmpipe): {max(lp, 0):.0f} of its {e:.0f} extra % run in"
+                    f" llvmpipe threads ({ctx.shell_renderer})")
+    if idle:
+        verdict("C3", extra(idle) <= 3,
+                f"an idle Herdr costs gnome-shell ~nothing: {extra(idle):+.1f}% against the baseline")
+    rates = [(n, row(n, "scroll")) for n in ("l-nocap", "launcher", "l-cap10")]
+    rates = [(n, x) for n, x in rates if x and x["draws"] >= 0.5]
+    if len(rates) >= 2:
+        costs = [per_draw(x, ["shell"]) for _, x in rates]
+        if all(c is not None and c > 0 for c in costs):
+            verdict("C4", max(costs) <= 1.6 * min(costs),
+                    "gnome-shell's cost is per draw, so fewer draws cost it proportionally less: "
+                    + ", ".join(f"{n} {x['desk']['shell']:.0f}% at {x['draws']:.0f}/s ({c:.1f} ms/draw)"
+                                for (n, x), c in zip(rates, costs)))
+    q = row("l-quarter", "scroll")
+    if sc and q:
+        a, b = per_draw(sc, ["shell"]), per_draw(q, ["shell"])
+        if a and b is not None:
+            verdict("C5", b <= 0.55 * a,
+                    f"gnome-shell's cost per draw grows with the window's pixels: quarter window {b:.1f} vs maximized"
+                    f" {a:.1f} ms/draw")
+    f = row("l-full", "scroll")
+    if sc and f and extra(sc) >= 10:
+        verdict("C6", extra(f) <= 0.3 * extra(sc),
+                f"gnome-shell stops compositing a full-screen Herdr: {f['desk']['shell']:.0f}% full screen vs"
+                f" {sc['desk']['shell']:.0f}% maximized, both scrolling ({f['draws']:.0f} and {sc['draws']:.0f} draws/s)")
+    shells = [(x["desk"]["shell"], r.name) for r in runs for s_, x in r.rows.items() if x and s_ == "scroll" and "desk" in x]
+    if shells:
+        best = min(shells)
+        w(f"Lowest gnome-shell CPU while scrolling: {best[1]} ({best[0]:.0f}%; baseline {base['shell']:.0f}%)")
 
 
 def main():
@@ -924,12 +1107,20 @@ def main():
     for s in SETUPS:
         if wanted and s[0] not in wanted:
             continue
-        if s[0] == "launcher":
+        if s[0] == "launcher" or (s[2] and LAUNCHER in s[2]):
             ctx.launcher = launcher_env()
             if ctx.launcher is None:
                 skipped.append((s[0], "personal/herdr-app.in not found next to this script"))
                 continue
-            s = (s[0], s[1], ctx.launcher) + tuple(s[3:])
+            env = dict(ctx.launcher)
+            for k, v in (s[2] or {}).items():
+                if k == LAUNCHER:
+                    continue
+                if v is None:
+                    env.pop(k, None)
+                else:
+                    env[k] = v
+            s = (s[0], s[1], env) + tuple(s[3:])
         if s[3] == "vgl" and not ctx.vgl:
             skipped.append((s[0], "VirtualGL not installed (3.1 or later: github.com/VirtualGL/virtualgl/releases)"))
         elif s[3] == "vgl" and ctx.nvidia and not ctx.nvidia_ok:
@@ -945,13 +1136,21 @@ def main():
     ctx.gen = os.path.join(ctx.root, "output.py")
     with open(ctx.gen, "w") as f:
         f.write(GEN)
-    minutes = sum(len(s[5]) * (SETTLE + args.seconds + 1) + 8 for s in setups) / 60
+    ctx.desk, ctx.desk_names = desktop_procs()
+    ctx.shell_renderer = shell_renderer(ctx.desk["shell"])
+    ctx.session_type = (os.environ.get("XDG_SESSION_TYPE") or "?").strip()[:12]
+    minutes = (sum(len(s[5]) * ((10.0 if s[4] == "full" else SETTLE) + args.seconds + 1) + 8 for s in setups)
+               + args.seconds) / 60
     say(f"{len(setups)} setups, about {minutes:.0f} minutes; keep the test window on screen")
     runs = []
     probe = Run(ctx, setups[0]) if setups else None
     try:
         if probe:
             probe.prepare()
+        say(f"baseline: the desktop with no test window, {args.seconds:g} s")
+        a, t0 = desk_ticks(ctx.desk), time.monotonic()
+        time.sleep(args.seconds)
+        ctx.baseline = desk_pct(a, desk_ticks(ctx.desk), time.monotonic() - t0)
         r = subprocess.run([ctx.hc, "server", "start"], env=probe.env() if probe else os.environ,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if r.returncode:
