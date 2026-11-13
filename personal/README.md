@@ -9,7 +9,7 @@ cells) and the settings below.
 ## A new machine
 
 ```sh
-git clone --branch claude/admiring-tesla-qdekso https://github.com/erosca/herdr-app
+git clone --branch claude/charming-sagan-deb1x6 https://github.com/erosca/herdr-app
 cd herdr-app
 personal/setup.sh              # a machine with a GPU
 personal/setup.sh --nomachine  # a NoMachine desktop (software rendering)
