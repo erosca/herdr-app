@@ -2,14 +2,17 @@
 // A viewed done agent stays in Done until left. Sub-agents that finished stay under
 // their agent in one folded "n finished" row while the core keeps them (a day after
 // their parent saw the result), a follow-up under the same name with its first run;
-// clicking one opens its conversation (conversation.js), dismissing hides it.
+// clicking one opens its conversation (conversation.js), dismissing hides it. A
+// sub-agent still working opens the same window, filled as it goes, when Herdr reads
+// its agent's log (codex, Kimi Code); any other, or one that needs the person, opens
+// as its terminal (peek).
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc } from "herdr";
 import { icon, ending, clock, about } from "./util.js";
 import { initConversation, conversationView } from "./conversation.js";
-import { groupThreads, threadOf, belongs, fullRecord } from "./thread.js";
+import { groupThreads, threadOf, belongs, fullRecord, agentOf } from "./thread.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -80,7 +83,7 @@ function connectors(t, lines) {
 
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.thread) return initConversation(this, cx);
+    if (props()?.thread || props()?.conversation) return initConversation(this, cx);
     if (props()?.sortMenu) return;
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
@@ -414,6 +417,20 @@ export default class Agents extends View {
     run("terminal.peek", { terminal: addr });
   }
 
+  // A running sub-agent: its conversation so far, read from its agent's own log, with
+  // the rounds it finished before. Its terminal instead when there is no such log to
+  // read, or when it waits for the person: that is where they answer it.
+  look(k, status, asker) {
+    if (status === "blocked" || !agentOf(k)) return this.peek(k.address);
+    const mine = threadOf([k]);
+    const earlier = this.done.filter((d) => belongs(mine, d)).sort((x, y) => (x.created_ms ?? 0) - (y.created_ms ?? 0));
+    openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
+      thread: { ...threadOf([...earlier, k]), name: this.nameOf(k), program: this.progOf(k), asker },
+      runs: earlier.map((d) => this.slim(d)),
+      live: [this.slim(k)],
+    } });
+  }
+
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
   // `more`: a row follows the last one (the finished row), so its line goes on.
   tree(all, addr, lead = [], more = false) {
@@ -431,7 +448,7 @@ export default class Agents extends View {
     });
   }
 
-  subRow(t, s, shown, compact) {
+  subRow(t, s, shown, compact, asker) {
     const k = s.t;
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
@@ -448,7 +465,7 @@ export default class Agents extends View {
       .text_size(12.5)
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
-      .on_click(() => this.peek(k.address))
+      .on_click(() => this.look(k, st, asker))
       .children(connectors(t, s.lines))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
@@ -468,7 +485,7 @@ export default class Agents extends View {
 
   render(cx) {
     const t = theme();
-    if (props()?.thread) return conversationView(this, t);
+    if (props()?.thread || props()?.conversation) return conversationView(this, t);
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
     const sort = sortOf();
@@ -498,12 +515,12 @@ export default class Agents extends View {
       if (done.length) subs = this.tree(all, a.address, [], true);
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
-      const rows = [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority))];
+      // Who asked, as the conversation's request blocks say it: the agent, or a sub-agent.
+      const askers = new Map([[a.address, a.program?.name || "Parent"], ...subs.map((s) => [s.t.address, this.nameOf(s.t)])]);
+      const rows = [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority, askers.get(s.t.parent) ?? "Parent"))];
       if (done.length) {
         const open = this.openDone.has(a.address);
         rows.push(this.doneHeader(t, a, done, open));
-        // Who asked, as the conversation's request blocks say it: the agent, or a sub-agent.
-        const askers = new Map([[a.address, a.program?.name || "Parent"], ...subs.map((s) => [s.t.address, this.nameOf(s.t)])]);
         const names = done.map((th) => this.nameOf(th.runs[th.runs.length - 1]));
         const repeated = (j) => names.indexOf(names[j]) !== names.lastIndexOf(names[j]);
         if (open) rows.push(...done.map((th, j) => this.doneRow(t, th, ["", j === done.length - 1 ? "└" : "├"], now,

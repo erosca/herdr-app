@@ -2,10 +2,13 @@
 // sub-agent, or a terminal address link): who it is and how it's doing, ↗ to
 // go to its pane (or, without one, keep it as a tab of the shown space), ✕ to
 // close. Props: { terminal, overlay }.
+// The terminal below is the live one: keys typed here go to its program. A sub-agent
+// whose own log Herdr reads (codex, Kimi Code) also has a window that only reads, with
+// its request, steps and answer set out: Conversation opens it.
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { agents, terminals, panes, run, theme, props, closeOverlay } from "herdr";
+import { agents, terminals, panes, run, theme, props, closeOverlay, openOverlay } from "herdr";
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // The icon from the app's program table: a one-color glyph or a picture.
@@ -14,6 +17,7 @@ function icon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
 const WORDS = { working: "working", blocked: "needs you", done: "finished", idle: "idle" };
+const logged = (k) => Boolean(k?.parent) && (k.program?.key === "codex" || /^kimi/.test(k.program?.key ?? ""));
 
 export default class Peek extends View {
   init(_props, cx) {
@@ -65,6 +69,12 @@ export default class Peek extends View {
       .when(Boolean(st), (el) => el.child(div().flex_none().text_color(t[st] ?? t.dim).child(WORDS[st] ?? st)))
       .when(Boolean(parent), (el) => el.child(div().truncate().text_color(t.dim).child(`from ${parent.name || parent.address}`)))
       .child(div().flex_1())
+      .when(logged(k), (el) => el.child(
+        this.button(t, "conversation", "Conversation", () => {
+          closeOverlay(overlay);
+          openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: { conversation: terminal } });
+        }),
+      ))
       .child(
         this.button(t, "keep", home ? "↗ go to" : "↗ keep", () => {
           run(home ? "pane.focus" : "terminal.keep", { terminal });

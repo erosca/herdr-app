@@ -8,11 +8,13 @@
 //      (what it ran, read, edited and said), the final answer, the tokens;
 //   3. the terminal: its command line and the last 1000 lines herdr-core keeps.
 // A run's log is the session named on its command line, else the one in the run's
-// folder with a turn that began while the run was alive.
+// folder with a turn that began while the run was alive. A run still going is read the
+// same way, and read on from where the last look ended (liveSteps).
 
 import { hc, exec, readTextFile } from "herdr";
 
-const CODEX_SESSION = /session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+// The session id in a run's output: as codex prints it, or as a line `session <id>`.
+const CODEX_SESSION = /(?:session id:|^session)\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/im;
 // Text codex adds to a user turn itself: environment, AGENTS.md, skills, notices.
 const CONTEXT = /^\s*(<(?!stdin\b)[A-Za-z_][\w-]*[\s>]|# AGENTS\.md instructions)/;
 
@@ -176,7 +178,9 @@ export function requestFromArgv(argv, agent = null) {
 
 // Steps: { at, kind, text, detail?, error?, ms? }. kind: think (what it set out to do),
 // say (what it told along the way), run, read, edit, search, fetch, plan, tool.
-// error: true, or a word for it ("exit 1"). ms: how long it took.
+// error: true, or a word for it ("exit 1"). ms: how long it took. `detail` is the whole
+// of it where `text` is its first line: a command for a tooltip, what was said in full.
+const SAID = 20000;
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const firstLine = (s) => s.split("\n").find((l) => l.trim())?.trim() ?? "";
 
@@ -185,7 +189,7 @@ function step(at, kind, full, detail = null) {
   const one = firstLine(all);
   const text = clip(one, 240) + (all.includes("\n") && one.length <= 240 ? " …" : "");
   const more = String(detail ?? all).trim();
-  return { at, kind, text, detail: more && more !== text ? clip(more, 1500) : null };
+  return { at, kind, text, detail: more && more !== text ? clip(more, kind === "say" ? SAID : 1500) : null };
 }
 
 /** A thought's headline: its bold title, else its first line. */
@@ -303,6 +307,11 @@ export function readRollout(text, { cwd = null } = {}) {
         const s = codexItem(p.item, p.started_at_ms ?? at, cwd);
         if (s) round.items.push(s);
         if (at != null) round.end = at;
+      } else if (p.type === "task_complete" || p.type === "turn_complete" || p.type === "turn_aborted") {
+        // The turn is over: what it said last is its answer.
+        round.done = true;
+        if (at != null) round.end = at;
+        if (p.type === "turn_aborted") round.ended = round.ended ?? (typeof p.reason === "string" ? p.reason : "stopped");
       }
       continue;
     }
@@ -348,11 +357,12 @@ export function readRollout(text, { cwd = null } = {}) {
   return { rounds: out.rounds.map((r) => finish(r, r.logged ? r.items : r.calls)) };
 }
 
-// A round as the window takes it: its steps in order, counted without the talk.
+// A round as the window takes it: its steps in order, counted without the talk. `done`:
+// its turn is over (a run still going has one that isn't).
 function finish(r, did) {
   const work = [...r.notes, ...did].sort(byTime);
   return { at: r.at, end: r.end, request: r.request, answer: r.answer, work, steps: did.length,
-    tokens: r.tokens || null, cached: r.cached || null, ended: r.ended ?? null };
+    tokens: r.tokens || null, cached: r.cached || null, ended: r.ended ?? null, done: Boolean(r.done || r.final) };
 }
 
 const TOOLS = { Bash: "run", Shell: "run", Read: "read", ReadFile: "read", ReadMediaFile: "read", Write: "edit", WriteFile: "edit", Edit: "edit",
@@ -455,14 +465,37 @@ find "$root/sessions" -name "rollout-*.jsonl*" -newermt "@$1" 2>/dev/null | whil
   $c "$f" 2>/dev/null | grep -E '"type":"(task_started|turn_started)"' | cut -c1-60
 done`;
 
-// A session's lines between two times ($2, $3: as codex writes them), of the kinds read here.
-const CODEX_LOG = CODEX_ROOT + String.raw`find "$root/sessions" "$root/archived_sessions" -name "rollout-*$1*.jsonl*" 2>/dev/null | sort | while IFS= read -r f; do
-  case "$f" in *.zst) zstd -dcq "$f" 2>/dev/null;; *) cat "$f";; esac
-done |
+// A log still being written is read on from where the last look ended ($off, in
+// bytes), and never a line in halves: `whole FILE` sets $size to FILE's length up to
+// its last whole line, `part FILE` prints its bytes from $off to there. Each log script
+// first prints `O <file> <size>`: where to read on from, next time.
+const PART = String.raw`whole() {
+  size=$(($({ wc -c < "$1"; } 2>/dev/null) + 0))
+  [ "$size" -gt "$off" ] || return 0
+  [ "$(tail -c +"$size" "$1" | head -c 1 | od -An -tu1 | tr -d ' \n')" = 10 ] ||
+    size=$((size - $(tail -c +$((off + 1)) "$1" | head -c $((size - off)) | tail -n 1 | wc -c)))
+}
+part() { [ "$size" -gt "$off" ] && tail -c +$((off + 1)) "$1" | head -c $((size - off)); }
+`;
+
+// A session's lines between two times ($2, $3: as codex writes them), of the kinds read
+// here. $5: the file to read on, or - to look for the session $1; $6: from which byte.
+// A session in several files, or a packed one, is read whole and not read on.
+const CODEX_LOG = CODEX_ROOT + PART + String.raw`f=$5; off=$6; all=; size=0
+if [ "$f" = - ]; then
+  f=$(find "$root/sessions" "$root/archived_sessions" -name "rollout-*$1*.jsonl*" 2>/dev/null | sort)
+  case "$f" in *"
+"*|*.zst) all=$f; f=;; esac
+fi
+[ -z "$f" ] || whole "$f"
+printf 'O\t%s\t%s\n' "$f" "$size"
+if [ -n "$f" ]; then part "$f"; else printf '%s\n' "$all" | while IFS= read -r g; do
+  case "$g" in "") ;; *.zst) zstd -dcq "$g" 2>/dev/null;; *) cat "$g";; esac
+done; fi |
 awk -v a="$2" -v b="$3" '{ t = substr($0, 15, 24); if (t >= a && t <= b) print }' |
-grep -E '^\{"timestamp":"[^"]*",("ordinal":[0-9]+,)?"type":"(response_item","payload":\{"type":"(message|reasoning|function_call|custom_tool_call|local_shell_call|web_search_call)"|event_msg","payload":\{"type":"(token_count|item_completed)")' |
+grep -E '^\{"timestamp":"[^"]*",("ordinal":[0-9]+,)?"type":"(response_item","payload":\{"type":"(message|reasoning|function_call|custom_tool_call|local_shell_call|web_search_call)"|event_msg","payload":\{"type":"(token_count|item_completed|task_complete|turn_complete|turn_aborted)")' |
 grep -v -E '"payload":\{"type":"(message"(,"id":"[^"]*")?,"role":"developer"|reasoning"(,"id":"[^"]*")?,"summary":\[\])|"item":\{"type":"(Reasoning|UserMessage|AgentMessage)"' |
-sed -E 's/"encrypted_content":"[^"]*"/"encrypted_content":null/g; s/"aggregated_output":"(\\.|[^"\\])*"/"aggregated_output":""/g; /"item":\{"type":"(FileChange|McpToolCall|Extension)"/ s/"(content|unified_diff|snippet|text|stdout)":"(\\.|[^"\\])*"/"\1":""/g' |
+sed -E 's/"encrypted_content":"[^"]*"/"encrypted_content":null/g; s/"(aggregated_output|last_agent_message)":"(\\.|[^"\\])*"/"\1":""/g; /"item":\{"type":"(FileChange|McpToolCall|Extension)"/ s/"(content|unified_diff|snippet|text|stdout)":"(\\.|[^"\\])*"/"\1":""/g' |
 head -c $4`;
 
 const KIMI_ROOT = String.raw`root=$KIMI_CODE_HOME; [ -n "$root" ] || root=$HOME/.kimi-code; root=$root/sessions
@@ -476,16 +509,23 @@ find "$root" -mindepth 5 -maxdepth 5 -path "*/agents/main/wire.jsonl" -newermt "
   grep '^{"type":"turn.prompt"' "$f" | sed -E 's/.*"time":([0-9]+)\}$/\1/' | tr '\n' ' '; echo
 done`;
 
-// A session's lines between two times ($2, $3: ms), of the kinds read here.
-const KIMI_LOG = KIMI_ROOT + String.raw`f=$(find "$root" -mindepth 5 -maxdepth 5 -path "*/$1/agents/main/wire.jsonl" 2>/dev/null | head -n 1)
+// A session's lines between two times ($2, $3: ms), of the kinds read here; $5 and $6
+// as for codex.
+const KIMI_LOG = KIMI_ROOT + PART + String.raw`f=$5; off=$6; size=0
+[ "$f" != - ] || f=$(find "$root" -mindepth 5 -maxdepth 5 -path "*/$1/agents/main/wire.jsonl" 2>/dev/null | head -n 1)
 [ -n "$f" ] || exit 3
-grep -E '^\{"type":"(turn\.prompt|turn\.ended|context\.append_loop_event)"' "$f" |
+whole "$f"
+printf 'O\t%s\t%s\n' "$f" "$size"
+part "$f" |
+grep -E '^\{"type":"(turn\.prompt|turn\.ended|context\.append_loop_event)"' |
 awk -v a="$2" -v b="$3" '{ if (match($0, /"time":[0-9]+\}$/)) { t = substr($0, RSTART + 7, RLENGTH - 8) + 0; if (t < a || t > b) next } print }' |
 sed -E '/"event":\{"type":"tool\.result"/ s/"output":"(\\.|[^"\\])*"/"output":""/; /"event":\{"type":"tool\.call"/ s/"(content|old_string|new_string)":"(\\.|[^"\\])*"/"\1":""/g' |
 head -c $4`;
 
-// While a run was alive, give or take: a turn that began then is that run's.
-const alive = (run) => [run.created_ms - 5000, (run.finished_ms ?? Date.now()) + 5000];
+// While a run was alive, give or take: a turn that began then is that run's. One still
+// going has no end yet.
+const NO_END = Date.UTC(2100, 0, 1);
+const alive = (run) => [run.created_ms - 5000, run.finished_ms != null ? run.finished_ms + 5000 : NO_END];
 const jsonString = (s) => { try { return JSON.parse(`"${s}"`); } catch (_) { return s; } };
 
 // What a find script printed: the run's folder as its machine resolves it, and the
@@ -557,17 +597,35 @@ const FIND = {
   },
 };
 
-// The rounds a run's session log has from while the run was alive.
+// What a log script printed: the lines, and where it read to: { file, offset, text }.
+function lines(out, had) {
+  const nl = out.indexOf("\n");
+  const [o, file, size] = (nl < 0 ? out : out.slice(0, nl)).split("\t");
+  const marked = o === "O";
+  let text = !marked ? out : nl < 0 ? "" : out.slice(nl + 1);
+  // Cut off at the limit, its last line is a half: whole lines only.
+  const cut = text.length >= LIMIT || (text !== "" && !text.endsWith("\n"));
+  if (cut) text = text.slice(0, text.lastIndexOf("\n") + 1);
+  return { file: (marked && file) || null, offset: marked ? Number(size) || 0 : 0, text: (had?.text ?? "") + text, cut: Boolean(had?.cut) || cut };
+}
+
+// The rounds a run's session log has from while the run was alive. `had`: what an
+// earlier look at a run still going returned; the log is read on from there.
 const READ = {
-  *codex(run, id, cwd) {
+  *codex(run, id, cwd, had = null) {
     const [from, to] = alive(run);
-    const r = yield sh(run, CODEX_LOG, [id, new Date(from).toISOString(), new Date(to).toISOString(), LIMIT]);
-    return { ...readRollout(r.stdout, { cwd }), cut: r.stdout.length >= LIMIT };
+    const r = yield sh(run, CODEX_LOG, [id, new Date(from).toISOString(), new Date(to).toISOString(), LIMIT, had?.file ?? "-", had?.offset ?? 0]);
+    const got = lines(r.stdout, had);
+    // A log shorter than it was is another file under the old name: from its start.
+    if (had && got.offset < had.offset) return yield* READ.codex(run, id, cwd);
+    return { ...readRollout(got.text, { cwd }), ...got };
   },
-  *kimi(run, id, cwd) {
+  *kimi(run, id, cwd, had = null) {
     const [from, to] = alive(run);
-    const r = yield sh(run, KIMI_LOG, [id, from, to, LIMIT]);
-    return { ...readWire(r.stdout, { cwd }), cut: r.stdout.length >= LIMIT };
+    const r = yield sh(run, KIMI_LOG, [id, from, to, LIMIT, had?.file ?? "-", had?.offset ?? 0]);
+    const got = lines(r.stdout, had);
+    if (had && got.offset < had.offset) return yield* READ.kimi(run, id, cwd);
+    return { ...readWire(got.text, { cwd }), ...got };
   },
 };
 
@@ -645,24 +703,78 @@ export function* roundsSteps(k) {
   });
 }
 
-/** A run still going: its request, and that it's running. */
-export function* liveSteps(k) {
-  const run = yield* recordSteps(k);
-  return [{ ...NOTHING, run, at: run.created_ms ?? null, end: null, request: (yield* labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv, agentOf(run)),
-    answer: null, transcript: null, cut: false, session: label(run, "herdr.session"), note: null, live: true }];
+// A log that isn't there in a run's first moments is only not there yet.
+const SETTLING = 20000;
+
+/** A run still going: { rounds, state }. Its rounds so far, from its agent's log, the
+ * last one unfinished (no answer yet: what it says along the way is among its steps);
+ * `state` is where this look ended, to hand back for the next one. Until the log has a
+ * request of this run it is looked for each time; from then on it is read on. */
+export function* liveSteps(k, had = null) {
+  // Its record changes while it runs (a session label, set once the session is known).
+  let run = had?.id ? had.run : yield* recordSteps({ ...k, argv: null });
+  if (!Array.isArray(run.argv)) run = k;
+  const agent = agentOf(run);
+  const where = machineOf(run.address) ? ` on ${machineOf(run.address)}` : "";
+  const asked = had ? had.asked : yield* labelFile(run, "herdr.request");
+  let id = had?.id ?? null;
+  let folder = had?.folder ?? run.cwd;
+  let log = null;
+  let note = null;
+  if (agent && run.created_ms != null) {
+    try {
+      if (id) log = yield* READ[agent](run, id, folder, had.file ? had : null);
+      else {
+        let named = label(run, "herdr.session") ?? sessionFromArgv(run.argv, agent);
+        if (named && !ID[agent].test(named)) named = null;
+        if (named) log = yield* READ[agent](run, named, folder);
+        if (log?.rounds.length) id = named;
+        else {
+          const found = yield* FIND[agent](run);
+          if (found.id && found.id !== named) {
+            folder = found.cwd ?? folder;
+            log = yield* READ[agent](run, found.id, folder);
+            if (log.rounds.length) id = found.id;
+          }
+          if (!id) {
+            log = null;
+            if (Date.now() - run.created_ms > SETTLING) note = named ? `${NAME[agent]}'s log of session ${named.replace(/^session_/, "").slice(0, 8)}${where} has no request of this run yet.` : found.note;
+          }
+        }
+      }
+    } catch (e) {
+      // A look that failed keeps what the last one showed, and says so.
+      log = had?.id ? { rounds: had.rounds ?? [], file: had.file, offset: had.offset, text: had.text, cut: had.cut } : null;
+      note = `${NAME[agent]}'s own log of this run couldn't be read${where}: ${why(e)}`;
+    }
+  }
+  const logged = log?.rounds ?? [];
+  const state = { run, asked, id, folder, rounds: logged, file: log?.file ?? null, offset: log?.offset ?? 0, text: log?.text ?? "", cut: log?.cut ?? false };
+  const base = { run, transcript: null, cut: false, session: id ?? label(run, "herdr.session"), live: true, note: null };
+  if (!logged.length) {
+    return { state, rounds: [{ ...base, ...NOTHING, done: false, note, at: run.created_ms ?? null, end: null,
+      request: asked ?? requestFromArgv(run.argv, agent), answer: null }] };
+  }
+  return { state, rounds: logged.map((r, i) => {
+    const last = i === logged.length - 1;
+    if (!last || r.done) return { ...base, ...r, note: last ? note : null, request: i === 0 && asked ? asked : r.request };
+    // Its turn isn't over: what it said last is not its answer yet. `seen`: when its
+    // log was last written to.
+    const work = r.answer ? [...r.work, step(r.end, "say", r.answer)] : r.work;
+    return { ...base, ...r, work, answer: null, end: null, seen: r.end, note: note ?? (log.cut ? TOO_LONG : null), request: i === 0 && asked ? asked : r.request };
+  }) };
 }
 
 // One run that can't be read costs its own round's details, never the others'.
 const unread = (run, e) => [{ ...NOTHING, run, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null,
   transcript: null, cut: false, session: null, live: false, note: `This run couldn't be read: ${why(e)}` }];
 
-/** Each run's rounds as one conversation, oldest first. */
+/** Rounds of several runs as one conversation, oldest first. */
 export const inOrder = (lists) => lists.flat().sort(byTime);
 
-/** Rounds oldest first: { at, end, run, request, answer, steps, work, tokens, cached, ended, transcript, cut, session, note, live }. */
-export async function loadConversation(runs, live = []) {
-  return inOrder(await Promise.all([
-    ...runs.map((run) => drive(roundsSteps(run)).catch((e) => unread(run, e))),
-    ...live.map((run) => drive(liveSteps(run)).catch((e) => unread(run, e))),
-  ]));
-}
+/** A finished run's rounds: { at, end, run, request, answer, steps, work, tokens, cached, ended, done, transcript, cut, session, note, live }. */
+export const finishedRounds = (run) => drive(roundsSteps(run)).catch((e) => unread(run, e));
+
+/** A running one's: { rounds, state }; hand `state` back at the next look. */
+export const liveRounds = (run, had = null) => drive(liveSteps(run, had))
+  .catch((e) => ({ state: had, rounds: unread(run, e).map((r) => ({ ...r, live: true, end: null })) }));
