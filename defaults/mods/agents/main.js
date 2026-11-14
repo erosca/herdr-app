@@ -9,7 +9,7 @@ import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc } from "herdr";
 import { icon, ending, clock, about } from "./util.js";
 import { initConversation, conversationView } from "./conversation.js";
-import { groupThreads, threadOf, belongs } from "./thread.js";
+import { groupThreads, threadOf, belongs, fullRecord } from "./thread.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -92,6 +92,7 @@ export default class Agents extends View {
     this.done = [];
     this.doneAt = 0;
     this.doneDirty = true;
+    this.records = {};
     this.openDone = new Set();
     this.dismissed = new Set(JSON.parse(localStorage.getItem("dismissed") ?? "[]"));
     // A sub-agent's program and name, kept from while it ran: the core's record has neither.
@@ -110,7 +111,18 @@ export default class Agents extends View {
         const r = await hc(["ls", "--all", "--json"]);
         if (r.code !== 0) return;
         const list = JSON.parse(r.stdout).terminals ?? [];
-        this.done = list.filter((k) => k.state === "finished" && k.parent);
+        // The list's short form has no times, command line or labels: each finished
+        // sub-agent's whole record is asked for once.
+        const finished = list.filter((k) => k.state === "finished" && k.parent);
+        const missing = finished.filter((k) => !this.records[k.address]);
+        for (let i = 0; i < missing.length; i += 8) {
+          for (const k of await Promise.all(missing.slice(i, i + 8).map(fullRecord))) {
+            if (k.created_ms != null) this.records[k.address] = k;
+          }
+        }
+        const known = new Set(list.map((k) => k.address));
+        for (const a of Object.keys(this.records)) if (!known.has(a)) delete this.records[a];
+        this.done = finished.map((k) => ({ ...this.records[k.address], ...k }));
         this.forget(list);
       } catch (_) {
         // Keep the last list: a core that's restarting answers again soon.

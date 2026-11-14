@@ -9,7 +9,7 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
 import { props, run, closeOverlay, settings, terminals, hc } from "herdr";
-import { loadConversation, belongs } from "./thread.js";
+import { loadConversation, belongs, fullRecord } from "./thread.js";
 import { icon, ending, span, clock } from "./util.js";
 
 const SHOWN_LINES = 8;
@@ -49,6 +49,8 @@ function load(v, cx) {
     const atEnd = v.rounds === null || v.openRound === v.rounds.length - 1;
     let rounds;
     try {
+      // Records from the list lack their times and command line: the header needs them.
+      v.runs = await Promise.all(v.runs.map(fullRecord));
       rounds = await loadConversation(v.runs, v.live);
     } catch (_) {
       rounds = v.rounds ?? [];
@@ -72,7 +74,7 @@ function refresh(v, cx, live) {
     try {
       const r = await hc(["ls", "--all", "--json"]);
       const list = r.code === 0 ? JSON.parse(r.stdout).terminals ?? [] : [];
-      const finished = list.filter((k) => k.state === "finished" && belongs(v.thread, k));
+      const finished = await Promise.all(list.filter((k) => k.state === "finished" && belongs(v.thread, k)).map(fullRecord));
       for (const k of live) if (k.program) v.programs[k.address] = k.program;
       const named = (k) => ({ ...k, program: k.program ?? v.programs[k.address] ?? v.thread.program ?? null });
       // A run the core has forgotten stays as it was.

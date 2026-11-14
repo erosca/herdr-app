@@ -79,9 +79,25 @@ export function belongs(th, k) {
   return Boolean((name && th.names?.includes(name)) || (session && th.sessions?.includes(session)));
 }
 
+// `hc ls --json` lists a short form of each terminal, without its command line, labels
+// or times: the whole record comes from `hc get`. A finished one doesn't change.
+export async function fullRecord(k) {
+  if (Array.isArray(k.argv) && k.created_ms != null) return k;
+  try {
+    const r = await hc(["get", k.address, "--json"]);
+    if (r.code !== 0) return k;
+    const full = JSON.parse(r.stdout);
+    // The list's address and parent say which machine; keep them as the list has them.
+    return { ...k, ...full, address: k.address, parent: k.parent ?? full.parent ?? null, program: k.program ?? null };
+  } catch (_) {
+    return k;
+  }
+}
+
 // The prompt on the command line: codex's last plain argument, else the longest
 // argument that reads like a sentence. Null for a shell script (`sh -c ...`).
-export function requestFromArgv(argv = []) {
+export function requestFromArgv(argv) {
+  if (!Array.isArray(argv)) return null;
   if (argv.length > 1 && /(^|\/)(ba|z|da)?sh$/.test(argv[0]) && argv[1] === "-c") return null;
   const words = argv.slice(1).filter((a) => /\s/.test(a) && a.length >= 20);
   return words.sort((x, y) => y.length - x.length)[0] ?? null;
@@ -145,6 +161,7 @@ async function codexLog(id) {
 // A first round with no id at hand: the session that started in the run's folder
 // within a minute and a half of the run.
 async function codexMatch(run) {
+  if (run.created_ms == null || !run.cwd) return null;
   const since = Math.floor((run.created_ms - 120000) / 1000);
   const script = 'find "$1" -name "rollout-*.jsonl*" -newermt "@$2" 2>/dev/null | while read -r f; do '
     + 'case "$f" in *.zst) zstd -dcq "$f" 2>/dev/null | head -n 1;; *) head -n 1 "$f";; esac; done';
@@ -186,34 +203,44 @@ async function labelFile(run, key) {
 
 /** Rounds oldest first: { at, end, run, request, answer, steps, transcript, cut, session, live }. */
 export async function loadConversation(runs, live = []) {
+  runs = await Promise.all(runs.map(fullRecord));
+  live = await Promise.all(live.map(fullRecord));
   const rounds = [];
   const sessions = new Map(); // session id -> its rounds from the log
   const facts = [];
+  // One run that can't be read costs its own round's details, never the others'.
   for (const run of runs) {
-    const term = await terminalText(run);
+    let term = { text: null, cut: false };
     let session = label(run, "herdr.session");
-    if (!session && isCodex(run)) session = term.text?.match(CODEX_SESSION)?.[1] ?? (await codexMatch(run));
+    try {
+      term = await terminalText(run);
+      if (!session && isCodex(run)) session = term.text?.match(CODEX_SESSION)?.[1] ?? (await codexMatch(run));
+      if (session && !sessions.has(session)) sessions.set(session, (await codexLog(session).catch(() => null))?.rounds ?? []);
+    } catch (_) {}
     facts.push({ run, term, session });
-    if (session && !sessions.has(session)) sessions.set(session, (await codexLog(session).catch(() => null))?.rounds ?? []);
   }
   const used = new Set();
   for (const { run, term, session } of facts) {
-    const from = run.created_ms - 5000;
-    const to = (run.finished_ms ?? Date.now()) + 5000;
-    const logged = (sessions.get(session) ?? []).filter((r) => r.at != null && r.at >= from && r.at <= to);
-    const asked = await labelFile(run, "herdr.request");
-    const answered = await labelFile(run, "herdr.answer");
     const base = { run, transcript: term.text, cut: term.cut, session, live: false };
-    if (logged.length) {
-      logged.forEach((r, i) => {
-        used.add(r);
-        const last = i === logged.length - 1;
-        rounds.push({ ...base, at: r.at, end: last ? run.finished_ms ?? r.end : r.end,
-          request: i === 0 && asked ? asked : r.request, answer: last && answered ? answered : r.answer, steps: r.steps });
-      });
-    } else {
-      rounds.push({ ...base, at: run.created_ms, end: run.finished_ms, request: asked ?? requestFromArgv(run.argv),
-        answer: answered, steps: null });
+    try {
+      const from = (run.created_ms ?? 0) - 5000;
+      const to = (run.finished_ms ?? Date.now()) + 5000;
+      const logged = run.created_ms == null ? [] : (sessions.get(session) ?? []).filter((r) => r.at != null && r.at >= from && r.at <= to);
+      const asked = await labelFile(run, "herdr.request");
+      const answered = await labelFile(run, "herdr.answer");
+      if (logged.length) {
+        logged.forEach((r, i) => {
+          used.add(r);
+          const last = i === logged.length - 1;
+          rounds.push({ ...base, at: r.at, end: last ? run.finished_ms ?? r.end : r.end,
+            request: i === 0 && asked ? asked : r.request, answer: last && answered ? answered : r.answer, steps: r.steps });
+        });
+      } else {
+        rounds.push({ ...base, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: asked ?? requestFromArgv(run.argv),
+          answer: answered, steps: null });
+      }
+    } catch (_) {
+      rounds.push({ ...base, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null, steps: null });
     }
   }
   // Rounds of these sessions that ran outside Herdr, or in terminals the core forgot.
@@ -224,7 +251,7 @@ export async function loadConversation(runs, live = []) {
     }
   }
   for (const run of live) {
-    rounds.push({ at: run.created_ms, end: null, run, request: (await labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv),
+    rounds.push({ at: run.created_ms ?? null, end: null, run, request: (await labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv),
       answer: null, steps: null, transcript: null, cut: false, session: label(run, "herdr.session"), live: true });
   }
   return rounds.sort((x, y) => (x.at ?? 0) - (y.at ?? 0));
