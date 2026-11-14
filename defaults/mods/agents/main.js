@@ -271,14 +271,20 @@ export default class Agents extends View {
       .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`, "Clear finished", done.map((k) => k.address))));
   }
 
+  nameOf(k) {
+    const known = this.progs[k.address];
+    return k.name || k.template || known?.n || (k.program ?? known?.p)?.name || k.address;
+  }
+
   // One finished sub-agent: dimmed, how it ended if not cleanly, and since when.
-  doneRow(t, k, lines, now) {
+  // Names are unique only among running terminals: a name used again gets its end time.
+  doneRow(t, k, lines, now, repeated = false) {
     const id = `fin-${k.address}`;
     const known = this.progs[k.address];
     const prog = k.program ?? known?.p;
     const pic = icon(prog, 14, t.dim);
     const end = ending(k);
-    const name = k.name || k.template || known?.n || prog?.name || k.address;
+    const name = this.nameOf(k);
     return this.hoverable(h_flex().id(id), id)
       .pl(39)
       .pr(8)
@@ -290,10 +296,11 @@ export default class Agents extends View {
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
       .tooltip(about(k))
-      .on_click(() => openOverlay({ mod: "agents", kind: "dialog", width: 760, height: 520, props: { output: k.address, name, about: about(k) } }))
+      // As big as a running sub-agent's peek.
+      .on_click(() => openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: { output: k.address, name, about: about(k) } }))
       .children(connectors(t, lines))
       .child(div().w(14).mr(8).flex_none().opacity(0.55).when(Boolean(pic), (el) => el.child(pic)))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(name))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(repeated && k.finished_ms != null ? `${name} · ${clock(k.finished_ms)}` : name))
       .when(Boolean(end), (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(end.bad ? t.blocked : t.dim).child(end.text)))
       .child(this.hovered === id
         ? this.dismissButton(t, `x-${k.address}`, "Dismiss", [k.address])
@@ -306,7 +313,11 @@ export default class Agents extends View {
       try {
         const r = await hc(["read", props().output, "--lines", "1000", "--json"]);
         let text = r.stdout;
-        try { text = JSON.parse(r.stdout).text ?? ""; } catch (_) {}
+        try {
+          const read = JSON.parse(r.stdout);
+          text = read.text ?? "";
+          this.cut = read.complete === false;
+        } catch (_) {}
         text = text.replace(/\s+$/, "");
         if (r.code !== 0) this.outputError = "Herdr-core no longer has this output.";
         else if (!text) this.outputError = "It printed nothing.";
@@ -344,6 +355,15 @@ export default class Agents extends View {
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => closeOverlay(p.overlay))
           .child(svg("mods/workspace-chrome/x.svg").size(13))))
+      .when(Boolean(this.cut && this.code), (el) => el.child(div()
+        .px(14)
+        .py(5)
+        .flex_none()
+        .border_b(1)
+        .border_color(t.border)
+        .text_size(11.5)
+        .text_color(t.dim)
+        .child("Earlier output isn't kept: herdr-core keeps the last 1,000 lines of a finished sub-agent.")))
       .child(this.code
         ? Editor.new(this.code).flex_1().min_h(0)
         : div().p(14).text_size(12).text_color(t.dim).child(this.outputError ?? "Loading…"));
@@ -534,7 +554,9 @@ export default class Agents extends View {
       if (done.length) {
         const open = this.openDone.has(a.address);
         rows.push(this.doneHeader(t, a, done, open));
-        if (open) rows.push(...done.map((k, j) => this.doneRow(t, k, ["", j === done.length - 1 ? "└" : "├"], now)));
+        const names = done.map((k) => this.nameOf(k));
+        const repeated = (k, j) => names.indexOf(names[j]) !== names.lastIndexOf(names[j]);
+        if (open) rows.push(...done.map((k, j) => this.doneRow(t, k, ["", j === done.length - 1 ? "└" : "├"], now, repeated(k, j))));
       }
       return rows;
     };
