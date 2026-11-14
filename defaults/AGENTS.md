@@ -165,14 +165,19 @@ the highlighted line shows where it will land.
   under the same `--name` and parent, or with the same `herdr.session` label, is
   the next round of the same conversation. Each round comes from the run's labels
   `herdr.request=<file>`, `herdr.answer=<file>` (absolute paths) and
-  `herdr.session=<session id>`, else from the agent's own session log, which
-  holds everything (codex's `~/.codex/sessions`, kimi's `~/.kimi/sessions`; found
-  by the session id on its command line, `codex exec resume <id>` or `kimi -r <id>`,
-  else by its folder and start time), else from the command line and the last
-  1000 lines of output. Asking a reviewer:
-  `hc run --name reviewer --label herdr.request=$PWD/.review/req-1.md --label herdr.answer=$PWD/.review/ans-1.md -- codex exec -o $PWD/.review/ans-1.md "$(cat .review/req-1.md)"`;
-  a follow-up runs `codex exec resume <session id> -o <answer file> "<question>"`
-  under the same name, with new files and `--label herdr.session=<session id>`.
+  `herdr.session=<session id>`, else from the agent's own session log on the
+  machine the run was on, which holds everything: codex's (`$CODEX_HOME` or
+  `~/.codex`, `sessions/`) and Kimi Code's (`$KIMI_CODE_HOME` or `~/.kimi-code`,
+  `sessions/`). The log is the session whose id is on the command line (as in
+  `codex exec resume <id>`, `kimi -S <id>`, also as a wrapper script's argument),
+  else the one in the run's folder with a turn that began while the run was alive;
+  a wrapper script is fine, and so is a prompt on stdin. Without a log a round shows
+  the request from the command line and the last 1000 lines of output, and a line
+  saying why no log was found. Asking a reviewer:
+  `hc run --name reviewer -- codex exec -s workspace-write -o $PWD/.review/ans-1.md "$(cat .review/req-1.md)"`;
+  a follow-up, under the same name:
+  `codex exec -s workspace-write resume <session id> -o <answer file> "<question>"`
+  (codex takes `-s` and `--color` before `resume`, not after).
   Ctrl-click (Cmd-click on macOS) a live terminal address in terminal text to
   peek at it. Bare addresses refer to the machine of the terminal showing them;
   use `machine/address` for another machine. Names and non-live addresses aren't links.

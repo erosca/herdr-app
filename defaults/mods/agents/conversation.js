@@ -6,6 +6,7 @@
 // Props: { thread: { name, program, asker, parent, names, sessions, addresses },
 //          runs: [finished run records], live: [running ones], overlay }.
 // While open it follows the conversation: a follow-up that starts or ends shows up.
+// A round's `note` says what couldn't be found or read, under its request.
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
@@ -20,8 +21,9 @@ const CUT = "Earlier output isn't kept: herdr-core keeps the last 1,000 lines of
 
 const liveKey = (list) => list.map((k) => k.address).sort().join(" ");
 
-export function initConversation(v, cx) {
-  const p = props();
+// `given`: the window's props; tests pass their own, with `rounds` already read.
+export function initConversation(v, cx, given = props()) {
+  const p = given;
   v.thread = p.thread ?? {};
   v.runs = p.runs ?? [];
   v.live = p.live ?? [];
@@ -38,6 +40,7 @@ export function initConversation(v, cx) {
   v.keys = cx.focus_handle();
   v.keys.focus();
   v.seen = liveKey(v.live);
+  if (p.rounds) return show(v, p.rounds);
   load(v, cx);
   // A follow-up starting, or a running round ending: read the conversation again.
   cx.timer.every(2000, (cx) => {
@@ -60,17 +63,24 @@ function load(v, cx) {
     } catch (_) {
       rounds = v.rounds ?? [];
     }
-    v.rounds = rounds;
-    v.editors = new Map();
-    // A round with no separate answer shows its output instead: ready its text view.
-    rounds.forEach((r, i) => {
-      if (!r.answer && !r.live && !r.work?.length && r.transcript) editor(v, r, i);
-    });
-    // Opens the newest round, unless the person is reading an earlier one.
-    if (atEnd) v.openRound = rounds.length - 1;
+    show(v, rounds, atEnd);
     v.loading = false;
     cx.notify();
   });
+}
+
+function show(v, rounds, atEnd = true) {
+  v.rounds = rounds;
+  // Each round's terminal text gets its view here: the engine doesn't let a render make one.
+  v.editors = new Map();
+  rounds.forEach((r, i) => {
+    if (r.transcript) {
+      v.editors.set(i, EditorState.new({ language: "text", value: r.transcript, readonly: true, line_numbers: false, folding: false,
+        soft_wrap: true, font_family: settings().font_family, font_size: 12 }));
+    }
+  });
+  // Opens the newest round, unless the person is reading an earlier one.
+  if (atEnd) v.openRound = rounds.length - 1;
 }
 
 function refresh(v, cx, live) {
@@ -93,14 +103,6 @@ function refresh(v, cx, live) {
     }
     load(v, cx);
   });
-}
-
-function editor(v, r, i) {
-  if (!v.editors.has(i)) {
-    v.editors.set(i, EditorState.new({ language: "text", value: r.transcript, readonly: true, line_numbers: false, folding: false,
-      soft_wrap: true, font_family: settings().font_family, font_size: 12 }));
-  }
-  return v.editors.get(i);
 }
 
 function key(v, e, cx) {
@@ -159,7 +161,7 @@ export function conversationView(v, t) {
         .text_size(11)
         .text_color(t.dim)
         .tooltip(`Session ${session}`)
-        .child(`session ${String(session).slice(0, 8)}`)))
+        .child(`session ${String(session).replace(/^session_/, "").slice(0, 8)}`)))
       .child(div()
         .id("conversation-close")
         .p(3)
@@ -220,7 +222,10 @@ function roundView(v, t, r, i, rounds) {
     .gap(6)
     .pb(12)
     .child(head)
-    .child(v_flex().pl(25).pr(6).gap(10).child(requestView(v, t, r, i)).children(answerViews(v, t, r, i, took)));
+    .child(v_flex().pl(25).pr(6).gap(10)
+      .child(requestView(v, t, r, i))
+      .when(Boolean(r.note), (el) => el.child(noteView(t, r)))
+      .children(answerViews(v, t, r, i, took)));
 }
 
 function requestView(v, t, r, i) {
@@ -252,6 +257,9 @@ function requestView(v, t, r, i) {
       .child(all ? "Show less" : `Show all ${lines.length} lines`)));
 }
 
+// What couldn't be found or read for this round, in a line.
+const noteView = (t, r) => div().text_size(11).text_color(t.dim).child(r.note);
+
 // The output box's height when it's all its round has: the window less what's above it.
 function fillHeight(v, r, i) {
   const lines = (r.request ?? "").replace(/\s+$/, "").split("\n").length;
@@ -265,7 +273,7 @@ function transcriptView(v, t, r, i, fill = false) {
   return v_flex()
     .gap(4)
     .when(r.cut, (el) => el.child(div().text_size(11).text_color(t.dim).child(CUT)))
-    .child(v_flex().h(fill ? fillHeight(v, r, i) : 320).rounded(6).border(1).border_color(t.border).child(Editor.new(editor(v, r, i)).flex_1().min_h(0)));
+    .child(v_flex().h(fill ? fillHeight(v, r, i) : 320).rounded(6).border(1).border_color(t.border).child(Editor.new(v.editors.get(i)).flex_1().min_h(0)));
 }
 
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
@@ -301,7 +309,9 @@ function stepRow(t, r, s, key) {
         .when(s.kind === "run", (el) => el.font_family(settings().font_family))
         .text_color(think ? t.foreground : t.muted)
         .child(text))
-    .when(Boolean(s.error), (el) => el.child(div().flex_none().text_size(11).text_color(t.blocked).child("failed")));
+    // How long it took, when that's worth a word, and how it failed.
+    .when(s.ms >= 2000 && !s.error, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(span(s.ms))))
+    .when(Boolean(s.error), (el) => el.child(div().flex_none().text_size(11).text_color(t.blocked).child(s.error === true ? "failed" : s.error)));
 }
 
 // What it did, step by step, from its own log; its terminal output one click away.
@@ -321,15 +331,11 @@ function stepsView(v, t, r, i) {
       .text_color(t.accent)
       .cursor_pointer()
       .on_click((_e, cx) => {
-        if (term) v.term.delete(i);
-        else {
-          editor(v, r, i);
-          v.term.add(i);
-        }
+        term ? v.term.delete(i) : v.term.add(i);
         cx.notify();
       })
       .child(term ? "Hide terminal output" : "Terminal output")))
-    .when(term && Boolean(r.transcript), (el) => el.child(transcriptView(v, t, r, i)));
+    .when(term && v.editors.has(i), (el) => el.child(transcriptView(v, t, r, i)));
 }
 
 function answerViews(v, t, r, i, took) {
@@ -357,13 +363,15 @@ function answerViews(v, t, r, i, took) {
   }
   const steps = r.work?.length > 0;
   if (!r.answer) {
-    if (steps) return [div().text_size(12).text_color(t.dim).child("It ended without an answer. What it did:"), stepsView(v, t, r, i)];
+    if (steps) return [div().text_size(12).text_color(t.dim).child(`It ended without an answer${r.ended ? ` (${r.ended})` : ""}. What it did:`), stepsView(v, t, r, i)];
     if (!r.transcript) return [div().text_size(12).text_color(t.dim).child("Nothing was recorded for this round.")];
     return [div().text_size(11).text_color(t.dim).child("Output (no separate answer was recorded)"), transcriptView(v, t, r, i, true)];
   }
   const out = [];
   const facts = [took ? `Worked ${took}` : "Work", r.steps != null ? `${r.steps} ${r.steps === 1 ? "step" : "steps"}` : null,
     r.tokens ? `${tokens(r.tokens)} tokens` : null].filter(Boolean).join(" · ");
+  // Tokens: what the model read anew and wrote. What it re-read from its cache each time is far more, and says little.
+  const tip = r.tokens && r.cached ? `${tokens(r.tokens)} tokens read anew and written, ${tokens(r.cached)} more re-read from cache` : null;
   const shown = v.work.has(i);
   out.push(h_flex()
     .id(`work-${i}`)
@@ -371,20 +379,17 @@ function answerViews(v, t, r, i, took) {
     .items_center()
     .text_size(11.5)
     .text_color(t.dim)
+    .when(Boolean(tip), (el) => el.tooltip(tip))
     .when(steps || Boolean(r.transcript), (el) => el
       .cursor_pointer()
       .hover((s) => s.text_color(t.foreground))
       .on_click((_e, cx) => {
-        if (shown) v.work.delete(i);
-        else {
-          if (!steps) editor(v, r, i);
-          v.work.add(i);
-        }
+        shown ? v.work.delete(i) : v.work.add(i);
         cx.notify();
       })
       .child(svg(`mods/workspace-chrome/chevron-${shown ? "down" : "right"}.svg`).size(10).flex_none()))
     .child(facts));
-  if (shown) out.push(steps ? stepsView(v, t, r, i) : transcriptView(v, t, r, i));
+  if (shown && (steps || v.editors.has(i))) out.push(steps ? stepsView(v, t, r, i) : transcriptView(v, t, r, i));
   out.push(div().text_size(13).text_color(t.foreground).child(TextView.markdown(`answer-${i}`, r.answer).selectable(true)));
   return out;
 }

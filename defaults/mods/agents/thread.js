@@ -1,48 +1,58 @@
 // A sub-agent's conversation: what its parent asked, what it did and what it answered,
 // round by round, from the best source each run has:
 //   1. labels its parent set: herdr.request=<file>, herdr.answer=<file>, herdr.session=<id>;
-//   2. the agent's own session log, nothing cut: codex's
-//      (~/.codex/sessions/**/rollout-<time>-<id>.jsonl[.zst]) or kimi's
-//      (~/.kimi/sessions/<md5 of its folder>/<id>/wire.jsonl): every request, each step
-//      (what it thought, ran, read and edited), the final answer, the tokens;
+//   2. the agent's own session log, on the machine the run was on, nothing cut:
+//      codex's ($CODEX_HOME or ~/.codex, sessions/**/rollout-<time>-<id>.jsonl[.zst]) or
+//      Kimi Code's ($KIMI_CODE_HOME or ~/.kimi-code,
+//      sessions/<folder>/<session id>/agents/main/wire.jsonl): the request, each step
+//      (what it ran, read, edited and said), the final answer, the tokens;
 //   3. the terminal: its command line and the last 1000 lines herdr-core keeps.
+// A run's log is the session named on its command line, else the one in the run's
+// folder with a turn that began while the run was alive.
 
-import { hc, exec, home, readTextFile } from "herdr";
+import { hc, exec, readTextFile } from "herdr";
 
 const CODEX_SESSION = /session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 // Text codex adds to a user turn itself: environment, AGENTS.md, skills, notices.
 const CONTEXT = /^\s*(<(?!stdin\b)[A-Za-z_][\w-]*[\s>]|# AGENTS\.md instructions)/;
 
+const uniq = (xs) => [...new Set(xs.filter(Boolean))];
 const machineOf = (addr) => (addr.includes("/") ? addr.split("/")[0] : null);
 const label = (run, key) => run.labels?.[key] || null;
-// A session id goes into a find pattern: only what an id can hold.
-const SESSION_ID = /^[0-9A-Za-z-]{8,64}$/;
+// Session ids go into find patterns: only these shapes do.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AGENTS = { codex: /(^|\/)codex$/, kimi: /(^|\/)kimi(-cli)?$/ };
+const KIMI_ID = /^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ID = { codex: UUID, kimi: KIMI_ID };
+const NAME = { codex: "Codex", kimi: "Kimi" };
+
+const LAUNCHER = /^(env|timeout|nice|nohup|stdbuf|time|script|sudo)$/;
+const isScript = (argv) => argv.length > 2 && /(^|\/)(ba|z|da)?sh$/.test(argv[0]) && /^-\w*c$/.test(argv[1]);
+// The words to look at: a shell script's, else the arguments as they are.
+const words = (argv) => (!Array.isArray(argv) ? [] : isScript(argv) ? argv[2].split(/[\s;|&()'"=]+/) : argv);
 
 /** "codex", "kimi", or null: whose session log a run left. */
 export function agentOf(run) {
   const key = run.program?.key ?? "";
   if (key === "codex") return "codex";
   if (/^kimi/.test(key)) return "kimi";
-  const argv = Array.isArray(run.argv) ? run.argv.slice(0, 4) : [];
-  for (const [name, re] of Object.entries(AGENTS)) if (argv.some((a) => re.test(a))) return name;
+  // Else by its command line: the program; a shell script's words; after a launcher or a
+  // wrapper script, its first arguments (`run-reviewer.sh codex ...`). Not any argument:
+  // `grep codex notes.md` isn't codex.
+  const argv = Array.isArray(run.argv) ? run.argv : [];
+  const first = (argv[0] ?? "").split("/").pop();
+  const wrapped = LAUNCHER.test(first) || /\.\w+$/.test(first);
+  for (const w of isScript(argv) ? words(argv) : argv.slice(0, wrapped ? 4 : 1)) {
+    const base = w.split("/").pop();
+    if (base === "codex") return "codex";
+    if (base === "kimi" || base === "kimi-code") return "kimi";
+  }
   return null;
 }
 
-// A follow-up names its session: `codex exec resume <id>`, `kimi -r <id>` (or -S, --session).
+// A follow-up names its session (`codex exec resume <id>`, `kimi -S <id>`), also through
+// a wrapper: any argument shaped like that agent's session ids.
 function sessionFromArgv(argv, agent) {
-  if (!Array.isArray(argv)) return null;
-  if (agent === "codex") {
-    const i = argv.indexOf("resume");
-    return i > 0 ? argv.slice(i + 1).find((a) => UUID.test(a)) ?? null : null;
-  }
-  if (agent === "kimi") {
-    const i = argv.findIndex((a) => /^(-r|-S|--resume|--session)$/.test(a));
-    const id = i > 0 ? argv[i + 1] : argv.find((a) => /^--(resume|session)=/.test(a))?.split("=")[1];
-    return id && SESSION_ID.test(id) ? id : null;
-  }
-  return null;
+  return (ID[agent] && words(argv).find((a) => ID[agent].test(a))) || null;
 }
 
 // What ties runs into one conversation: the same parent and name (a follow-up reuses
@@ -90,7 +100,6 @@ export function groupThreads(runs) {
 
 /** What the conversation window needs to find a thread's runs again: { parent, names, sessions, addresses }. */
 export function threadOf(runs) {
-  const uniq = (xs) => [...new Set(xs.filter(Boolean))];
   return {
     parent: runs[0]?.parent ?? null,
     names: uniq(runs.map((k) => k.name || k.template)),
@@ -107,12 +116,38 @@ export function belongs(th, k) {
   return Boolean((name && th.names?.includes(name)) || (session && th.sessions?.includes(session)));
 }
 
+// What this file asks of the app, one thing at a time: ["hc", args], ["sh", script,
+// args, machine] or ["file", path, machine]. Its work is written as steps that yield
+// such a request and get the answer back, so the same steps run in the app (`drive`)
+// and, in tests, against answers recorded from real runs.
+const HOST = {
+  hc: (args) => hc(args),
+  sh: (script, args, on) => exec("sh", ["-c", script, "sh", ...args], on ? { on } : {}),
+  file: (path, on) => readTextFile(path, on ? { on } : {}),
+};
+
+async function drive(steps) {
+  let r = steps.next();
+  while (!r.done) {
+    const [kind, ...args] = r.value;
+    let answer;
+    try {
+      answer = await HOST[kind](...args);
+    } catch (e) {
+      r = steps.throw(e);
+      continue;
+    }
+    r = steps.next(answer);
+  }
+  return r.value;
+}
+
 // `hc ls --json` lists a short form of each terminal, without its command line, labels
 // or times: the whole record comes from `hc get`. A finished one doesn't change.
-export async function fullRecord(k) {
+export function* recordSteps(k) {
   if (Array.isArray(k.argv) && k.created_ms != null) return k;
   try {
-    const r = await hc(["get", k.address, "--json"]);
+    const r = yield ["hc", ["get", k.address, "--json"]];
     if (r.code !== 0) return k;
     const full = JSON.parse(r.stdout);
     // The list's address and parent say which machine; keep them as the list has them.
@@ -122,24 +157,26 @@ export async function fullRecord(k) {
   }
 }
 
-// The prompt on the command line: kimi's -p/--prompt/-c/--command value, else the
-// longest argument that reads like a sentence (codex's prompt). Null for a shell
-// script (`sh -c ...`): its prompt can't be told from the rest.
+export const fullRecord = (k) => drive(recordSteps(k));
+
+// The prompt on the command line: kimi's -p/--prompt value, else the longest argument
+// that reads like a sentence (codex's prompt). Null for a shell script (`sh -c ...`),
+// whose prompt can't be told from the rest, and for a prompt fed on stdin or from a file.
 export function requestFromArgv(argv, agent = null) {
-  if (!Array.isArray(argv)) return null;
-  if (argv.length > 1 && /(^|\/)(ba|z|da)?sh$/.test(argv[0]) && argv[1] === "-c") return null;
+  if (!Array.isArray(argv) || isScript(argv)) return null;
   if ((agent ?? agentOf({ argv })) === "kimi") {
-    const i = argv.findIndex((a) => /^(-p|--prompt|-c|--command)$/.test(a));
+    const i = argv.findIndex((a) => a === "-p" || a === "--prompt");
     if (i > 0 && argv[i + 1]) return argv[i + 1];
-    const eq = argv.find((a) => /^--(prompt|command)=/.test(a));
+    const eq = argv.find((a) => a.startsWith("--prompt="));
     if (eq) return eq.slice(eq.indexOf("=") + 1);
   }
-  const words = argv.slice(1).filter((a) => /\s/.test(a) && a.length >= 20);
-  return words.sort((x, y) => y.length - x.length)[0] ?? null;
+  const said = argv.slice(1).filter((a) => /\s/.test(a) && a.length >= 20);
+  return said.sort((x, y) => y.length - x.length)[0] ?? null;
 }
 
-// Steps: { at, kind, text, detail?, error? }. kind: think (what it set out to do), say
-// (what it told along the way), run, read, edit, search, fetch, plan, tool.
+// Steps: { at, kind, text, detail?, error?, ms? }. kind: think (what it set out to do),
+// say (what it told along the way), run, read, edit, search, fetch, plan, tool.
+// error: true, or a word for it ("exit 1"). ms: how long it took.
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const firstLine = (s) => s.split("\n").find((l) => l.trim())?.trim() ?? "";
 
@@ -151,7 +188,7 @@ function step(at, kind, full, detail = null) {
   return { at, kind, text, detail: more && more !== text ? clip(more, 1500) : null };
 }
 
-/** A reasoning summary's headline: its bold title, else its first line. */
+/** A thought's headline: its bold title, else its first line. */
 export function headline(text) {
   const t = String(text ?? "");
   const bold = t.match(/\*\*([^*\n]+)\*\*/);
@@ -173,16 +210,20 @@ function shellText(a) {
   if (Array.isArray(a.command)) {
     const c = a.command;
     // ["bash", "-lc", "rg -n foo"]: the script is what it ran.
-    if (c.length >= 3 && /(^|\/)(ba|z|da)?sh$/.test(c[0]) && /^-\w*c$/.test(c[1])) return c.slice(2).join(" ");
-    return c.join(" ");
+    return isScript(c) ? c.slice(2).join(" ") : c.join(" ");
   }
   return null;
 }
 
+// A path as the agent's folder sees it.
+const within = (path, cwd) => (cwd && typeof path === "string" && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path);
+const byTime = (x, y) => (x.at ?? 0) - (y.at ?? 0);
+
 const patchPaths = (patch) => [...String(patch ?? "").matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1].trim());
 
-// One codex tool call as a step's { kind, text }, or null for plumbing.
-function codexStep(p) {
+// A tool call of a codex that doesn't log what its calls did (before 0.167): a step's
+// { kind, text }, or null for plumbing.
+function codexCall(p) {
   if (p.type === "local_shell_call") return { kind: "run", text: shellText(p.action ?? {}) ?? "a command" };
   if (p.type === "web_search_call") {
     const a = p.action ?? {};
@@ -202,13 +243,45 @@ function codexStep(p) {
   return { kind: "tool", text: p.namespace ? `${p.namespace}.${name}` : name || "a tool" };
 }
 
-const byTime = (x, y) => (x.at ?? 0) - (y.at ?? 0);
+const CHANGED = { add: " (new)", delete: " (deleted)" };
 
-/** codex's session log: requests start rounds; steps, answers and tokens fill them. */
-export function readRollout(text) {
-  const out = { id: null, rounds: [] };
+// What a codex call did, as codex logs it once done (`item_completed`): a step, or null.
+function codexItem(it, at, cwd) {
+  let s = null;
+  if (it.type === "CommandExecution") {
+    const parsed = Array.isArray(it.parsed_cmd) ? it.parsed_cmd : [];
+    const script = shellText(it) ?? parsed.map((c) => c.cmd).join(" && ");
+    const kinds = uniq(parsed.map((c) => c.type));
+    // codex says what a command amounts to: reading files or searching reads better than `sed -n 1,200p`.
+    if (kinds.length === 1 && kinds[0] === "read") s = step(at, "read", uniq(parsed.map((c) => within(c.path ?? c.name, cwd))).join(", "), script);
+    else if (kinds.length === 1 && kinds[0] === "search") s = step(at, "search", uniq(parsed.map((c) => [c.query, within(c.path, cwd)].filter(Boolean).join(" in "))).join(", "), script);
+    else s = step(at, "run", script);
+    if (it.exit_code != null && it.exit_code !== 0) s.error = `exit ${it.exit_code}`;
+    else if (it.status === "failed" || it.status === "declined") s.error = it.status;
+    const d = it.duration;
+    if (d && typeof d === "object") s.ms = Math.round((d.secs ?? 0) * 1000 + (d.nanos ?? 0) / 1e6);
+  } else if (it.type === "FileChange") {
+    const files = Object.entries(it.changes ?? {}).map(([path, c]) => `${within(path, cwd)}${CHANGED[c?.type] ?? ""}`);
+    s = step(at, "edit", files.join(", ") || "files");
+    if (it.status === "failed" || it.status === "declined") s.error = it.status;
+  } else if (it.type === "McpToolCall") {
+    const what = it.arguments?.url ?? it.arguments?.query ?? it.arguments?.path;
+    s = step(at, "tool", [`${it.appName ?? it.server ?? "MCP"}: ${it.actionName ?? it.tool ?? "a tool"}`, typeof what === "string" ? what : null].filter(Boolean).join(" "));
+    if (it.status === "failed") s.error = true;
+  } else if (it.type === "Extension" && it.kind === "web.search") {
+    const a = it.action ?? {};
+    if (a.type === "search") s = step(at, "search", a.query ?? a.queries?.join(", ") ?? it.query ?? "the web");
+    else s = step(at, "fetch", [a.pattern, a.url].filter(Boolean).join(" in ") || it.query || "a page");
+  } else if (it.type === "ContextCompaction") {
+    s = step(at, "plan", "Made room in its memory (compacted its context)");
+  }
+  return s;
+}
+
+/** codex's session log, or the part of it from one run: requests start rounds; steps, answers and tokens fill them. */
+export function readRollout(text, { cwd = null } = {}) {
+  const out = { rounds: [] };
   let round = null;
-  let total = null; // codex's running token count for the session
   const seen = new Set();
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
@@ -216,31 +289,37 @@ export function readRollout(text) {
     try { r = JSON.parse(line); } catch (_) { continue; }
     const p = r.payload ?? {};
     const at = Date.parse(r.timestamp) || null;
-    if (r.type === "session_meta") {
-      out.id = out.id ?? p.id ?? null;
-      continue;
-    }
     if (r.type === "event_msg") {
-      const sum = p.type === "token_count" ? p.info?.total_token_usage?.total_tokens : null;
-      if (typeof sum === "number") {
-        // A resumed session may count afresh.
-        if (round && sum < round.tokens0) round.tokens0 = 0;
-        if (round) round.tokens = sum - round.tokens0;
-        total = sum;
+      if (!round) continue;
+      if (p.type === "token_count") {
+        // One count for each answer of the model: what it read anew and wrote, and what came from cache.
+        const u = p.info?.last_token_usage;
+        if (!u) continue;
+        const cached = u.cached_input_tokens ?? 0;
+        round.tokens += Math.max(0, (u.input_tokens ?? 0) - cached) + (u.output_tokens ?? 0);
+        round.cached += cached;
+      } else if (p.type === "item_completed" && p.item) {
+        round.logged = true;
+        const s = codexItem(p.item, p.started_at_ms ?? at, cwd);
+        if (s) round.items.push(s);
+        if (at != null) round.end = at;
       }
       continue;
     }
     if (r.type !== "response_item") continue;
     if (p.type === "message" && p.role === "user") {
-      const asked = (p.content ?? [])
-        .filter((c) => c.type === "input_text" && c.text && !CONTEXT.test(c.text))
+      // codex marks what it added itself (environment, instructions); older logs are told by their text.
+      const kinds = p.internal_chat_message_metadata_passthrough?.content_item_kinds;
+      const parts = (p.content ?? []).filter((c) => c.type === "input_text" && c.text);
+      const marked = Array.isArray(kinds) && kinds.length === (p.content ?? []).length;
+      const asked = (marked ? (p.content ?? []).filter((c, i) => kinds[i] === "user.text" && c.type === "input_text" && c.text) : parts.filter((c) => !CONTEXT.test(c.text)))
         .map((c) => c.text.trim())
         .filter(Boolean)
         .join("\n\n");
       // A resumed session's files can repeat earlier turns.
       if (!asked || seen.has(`${at}\u0000${asked}`)) continue;
       seen.add(`${at}\u0000${asked}`);
-      round = { at, request: asked, answer: null, final: false, steps: 0, work: [], tokens: null, tokens0: total ?? 0, end: at };
+      round = { at, request: asked, answer: null, final: false, notes: [], calls: [], items: [], logged: false, tokens: 0, cached: 0, end: at };
       out.rounds.push(round);
       continue;
     }
@@ -249,190 +328,252 @@ export function readRollout(text) {
     if (p.type === "message" && p.role === "assistant") {
       const said = (p.content ?? []).filter((c) => c.type === "output_text").map((c) => c.text).join("").trim();
       if (!said) continue;
-      if (p.phase === "commentary") round.work.push(step(at, "say", said));
+      if (p.phase === "commentary") round.notes.push(step(at, "say", said));
       else if (p.phase === "final_answer") {
         round.answer = said;
         round.final = true;
       } else if (!round.final) {
         // No phases (older models): every message but the last was said along the way.
-        if (round.answer) round.work.push(step(round.answerAt, "say", round.answer));
+        if (round.answer) round.notes.push(step(round.answerAt, "say", round.answer));
         round.answer = said;
         round.answerAt = at;
       }
     } else if (p.type === "reasoning") {
-      for (const s of p.summary ?? []) if (s?.text?.trim()) round.work.push(step(at, "think", headline(s.text), s.text));
+      for (const s of p.summary ?? []) if (s?.text?.trim()) round.notes.push(step(at, "think", headline(s.text), s.text));
     } else if (/_call$/.test(p.type ?? "")) {
-      const s = codexStep(p);
-      if (s) {
-        round.work.push(step(at, s.kind, s.text));
-        round.steps += 1;
-      }
+      const s = codexCall(p);
+      if (s) round.calls.push(step(at, s.kind, s.text));
     }
   }
-  for (const r of out.rounds) {
-    r.work.sort(byTime);
-    delete r.tokens0;
-    delete r.answerAt;
-  }
-  return out;
+  return { rounds: out.rounds.map((r) => finish(r, r.logged ? r.items : r.calls)) };
 }
 
-const inputText = (u) => (typeof u === "string" ? u : Array.isArray(u) ? u.filter((c) => c?.type === "text").map((c) => c.text).join("\n") : "");
-
-// One kimi tool call as a step's { kind, text, detail? }.
-function kimiStep(name, raw) {
-  const a = parseArgs(raw);
-  switch (name) {
-    case "Shell": return { kind: "run", text: a.command ?? "a command" };
-    case "ReadFile": case "ReadMediaFile": return { kind: "read", text: a.path ?? name };
-    case "WriteFile": case "StrReplaceFile": return { kind: "edit", text: a.path ?? name };
-    case "Grep": return { kind: "search", text: [a.pattern, a.path].filter(Boolean).join(" in ") || name };
-    case "Glob": return { kind: "search", text: a.pattern ?? name };
-    case "SearchWeb": return { kind: "search", text: a.query ?? "the web" };
-    case "FetchURL": return { kind: "fetch", text: a.url ?? name };
-    case "Think": return { kind: "think", text: headline(a.thought), detail: a.thought };
-    case "SetTodoList": return { kind: "plan", text: "Updated its to-do list" };
-    default: return name ? { kind: "tool", text: name } : null;
-  }
+// A round as the window takes it: its steps in order, counted without the talk.
+function finish(r, did) {
+  const work = [...r.notes, ...did].sort(byTime);
+  return { at: r.at, end: r.end, request: r.request, answer: r.answer, work, steps: did.length,
+    tokens: r.tokens || null, cached: r.cached || null, ended: r.ended ?? null };
 }
 
-/** kimi's wire.jsonl: after a metadata line, { timestamp: seconds, message: { type, payload } } a line. */
-export function readWire(text) {
-  const out = { rounds: [] };
+const TOOLS = { Bash: "run", Shell: "run", Read: "read", ReadFile: "read", ReadMediaFile: "read", Write: "edit", WriteFile: "edit", Edit: "edit",
+  StrReplaceFile: "edit", MultiEdit: "edit", Grep: "search", Glob: "search", WebSearch: "search", SearchWeb: "search", WebFetch: "fetch", FetchURL: "fetch",
+  TodoList: "plan", SetTodoList: "plan", Think: "think" };
+
+// One Kimi Code tool call as a step.
+function kimiCall(ev, at, cwd) {
+  const a = parseArgs(ev.args);
+  const d = ev.display ?? {};
+  // Tools it doesn't name here go by how Kimi itself shows them.
+  const kind = TOOLS[ev.name] ?? (d.kind === "command" ? "run" : d.kind === "file_io" ? (d.operation === "read" ? "read" : "edit") : d.kind === "todo_list" ? "plan" : "tool");
+  const path = within(a.path ?? d.path, cwd);
+  if (kind === "run") return step(at, kind, a.command ?? d.command ?? ev.name);
+  if (kind === "read" || kind === "edit") return step(at, kind, path ?? ev.name);
+  if (kind === "search") return step(at, kind, [a.pattern ?? a.query, path].filter(Boolean).join(" in ") || ev.name);
+  if (kind === "fetch") return step(at, kind, a.url ?? ev.name);
+  if (kind === "plan") return step(at, kind, `Updated its to-do list${Array.isArray(a.todos) ? ` (${a.todos.length} items)` : ""}`);
+  if (kind === "think") return step(at, kind, headline(a.thought), a.thought);
+  return step(at, "tool", ev.name ?? "a tool");
+}
+
+/** Kimi Code's wire.jsonl, or the part of it from one run: { type, ..., time: ms } a line. */
+export function readWire(text, { cwd = null } = {}) {
+  const rounds = [];
   let round = null;
   let said = ""; // the text of the step in progress: the answer, if it's the last
   let saidAt = null;
   const calls = new Map();
   const keepSaid = () => {
-    if (round && said.trim()) round.work.push(step(saidAt, "say", said));
+    if (round && said.trim()) round.notes.push(step(saidAt, "say", said));
     said = "";
   };
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let r;
     try { r = JSON.parse(line); } catch (_) { continue; }
-    const m = r.message;
-    if (!m?.type) continue;
-    const p = m.payload ?? {};
-    const at = typeof r.timestamp === "number" ? Math.round(r.timestamp * 1000) : null;
-    if (m.type === "TurnBegin" || m.type === "SteerInput") {
-      if (round && !round.ended) keepSaid();
+    const at = typeof r.time === "number" ? r.time : null;
+    if (r.type === "turn.prompt") {
+      if (round && !round.done) keepSaid();
       said = "";
-      round = { at, request: inputText(p.user_input).trim() || null, answer: null, steps: 0, work: [], tokens: 0, end: at };
-      out.rounds.push(round);
+      const asked = (Array.isArray(r.input) ? r.input : []).filter((c) => c?.type === "text" && c.text).map((c) => c.text).join("\n").trim();
+      round = { at, request: asked || null, answer: null, notes: [], did: [], tokens: 0, cached: 0, end: at, done: false };
+      rounds.push(round);
       continue;
     }
-    if (!round || round.ended) continue;
+    if (!round || round.done) continue;
     if (at != null) round.end = at;
-    if (m.type === "StepBegin") keepSaid();
-    else if (m.type === "ContentPart") {
-      if (p.type === "text" && p.text) {
-        if (!said) saidAt = at;
-        said += p.text;
-      } else if (p.type === "think" && p.think?.trim()) round.work.push(step(at, "think", headline(p.think), p.think));
-    } else if (m.type === "ToolCall") {
-      const s = kimiStep(p.function?.name, p.function?.arguments);
-      if (!s) continue;
-      const st = step(at, s.kind, s.text, s.detail);
-      round.work.push(st);
-      if (p.id) calls.set(p.id, st);
-      if (s.kind !== "think") round.steps += 1;
-    } else if (m.type === "ToolResult") {
-      const st = calls.get(p.tool_call_id);
-      if (st && (p.is_error ?? p.return_value?.is_error)) st.error = true;
-    } else if (m.type === "StatusUpdate" && p.token_usage) {
-      const u = p.token_usage;
-      round.tokens += (u.input_other ?? 0) + (u.output ?? 0) + (u.input_cache_read ?? 0) + (u.input_cache_creation ?? 0);
-    } else if (m.type === "TurnEnd") {
+    if (r.type === "turn.ended") {
       // The last step's text is the answer.
       round.answer = said.trim() || null;
       said = "";
-      round.ended = true;
+      round.done = true;
+      if (r.reason && r.reason !== "completed") round.ended = r.reason;
+      continue;
+    }
+    const ev = r.type === "context.append_loop_event" ? r.event : null;
+    if (!ev) continue;
+    if (ev.type === "step.begin") keepSaid();
+    else if (ev.type === "content.part") {
+      const part = ev.part ?? {};
+      if (part.type === "text" && part.text) {
+        if (!said) saidAt = at;
+        said += part.text;
+      } else if (part.type === "think" && part.think?.trim()) round.notes.push(step(at, "think", headline(part.think), part.think));
+    } else if (ev.type === "tool.call") {
+      const s = kimiCall(ev, at, cwd);
+      (s.kind === "think" ? round.notes : round.did).push(s);
+      if (ev.toolCallId) calls.set(ev.toolCallId, s);
+    } else if (ev.type === "tool.result") {
+      const s = calls.get(ev.toolCallId);
+      if (s && ev.result?.isError) s.error = true;
+      if (s && typeof ev.result?.durationMs === "number") s.ms = ev.result.durationMs;
+    } else if (ev.type === "step.end" && ev.usage) {
+      const u = ev.usage;
+      round.tokens += (u.inputOther ?? 0) + (u.inputCacheCreation ?? 0) + (u.output ?? 0);
+      round.cached += u.inputCacheRead ?? 0;
     }
   }
-  if (round && !round.ended) keepSaid();
-  for (const r of out.rounds) {
-    r.work.sort(byTime);
-    if (!r.tokens) r.tokens = null;
-    delete r.ended;
-  }
-  return out;
+  if (round && !round.done) keepSaid();
+  return { rounds: rounds.map((r) => finish(r, r.did)) };
 }
 
-// The files of a codex session (a resumed one may span several, older ones compressed).
-// Tool outputs, codex's instructions and encrypted reasoning are most of a log's size
-// and nothing we show.
-const CODEX_LOG = String.raw`id=$1; shift; for f in $(find "$@" -name "rollout-*$id*.jsonl*" 2>/dev/null | sort); do case "$f" in *.zst) zstd -dcq "$f" 2>/dev/null;; *) cat "$f";; esac; done | grep -v -e '_call_output"' -e '"type":"turn_context"' -e '"role":"developer"' | sed -E 's/"encrypted_content":"[^"]*"/"encrypted_content":null/g'`;
+// Everything about a run's log happens on the machine the run was on: the scripts find
+// that machine's own home, and send back only the lines read here, without what the
+// tools printed (most of a log, and nothing shown).
+const LIMIT = 4000000;
+const TOO_LONG = "This run's log is longer than Herdr reads (4 MB): its end is missing.";
+const sh = (run, script, args) => ["sh", script, args.map(String), machineOf(run.address)];
 
-async function codexLog(id) {
-  if (!UUID.test(id)) return null;
-  const r = await exec("sh", ["-c", CODEX_LOG, "sh", id, `${home()}/.codex/sessions`, `${home()}/.codex/archived_sessions`]);
-  return r.stdout ? readRollout(r.stdout) : null;
-}
+const CODEX_ROOT = String.raw`root=$CODEX_HOME; [ -n "$root" ] || root=$HOME/.codex
+`;
+// The folder as the machine resolves it, then for each session written to since $1:
+// F <file>, the start of its first line (its folder), the start of each turn's line (its time).
+const CODEX_FIND = CODEX_ROOT + String.raw`(cd "$2" 2>/dev/null && pwd -P) || echo
+find "$root/sessions" -name "rollout-*.jsonl*" -newermt "@$1" 2>/dev/null | while IFS= read -r f; do
+  case "$f" in *.zst) c="zstd -dcq";; *) c=cat;; esac
+  printf 'F\t%s\n' "$f"
+  $c "$f" 2>/dev/null | head -n 1 | cut -c1-3000
+  $c "$f" 2>/dev/null | grep -E '"type":"(task_started|turn_started)"' | cut -c1-60
+done`;
 
-// A first round with no id at hand: the session that started in the run's folder
-// within a minute and a half of the run.
-async function codexMatch(run) {
-  if (run.created_ms == null || !run.cwd) return null;
-  const since = Math.floor((run.created_ms - 120000) / 1000);
-  const script = 'find "$1" -name "rollout-*.jsonl*" -newermt "@$2" 2>/dev/null | while read -r f; do '
-    + 'case "$f" in *.zst) zstd -dcq "$f" 2>/dev/null | head -n 1;; *) head -n 1 "$f";; esac; done';
-  const r = await exec("sh", ["-c", script, "sh", `${home()}/.codex/sessions`, String(since)]);
-  let best = null;
-  for (const line of r.stdout.split("\n")) {
-    try {
-      const m = JSON.parse(line);
-      const p = m.payload ?? {};
-      if (m.type !== "session_meta" || p.cwd !== run.cwd) continue;
-      const off = Math.abs((Date.parse(p.timestamp) || 0) - run.created_ms);
-      if (off < 90000 && (!best || off < best.off)) best = { id: p.id, off };
-    } catch (_) {}
-  }
-  return best?.id ?? null;
-}
+// A session's lines between two times ($2, $3: as codex writes them), of the kinds read here.
+const CODEX_LOG = CODEX_ROOT + String.raw`find "$root/sessions" "$root/archived_sessions" -name "rollout-*$1*.jsonl*" 2>/dev/null | sort | while IFS= read -r f; do
+  case "$f" in *.zst) zstd -dcq "$f" 2>/dev/null;; *) cat "$f";; esac
+done |
+awk -v a="$2" -v b="$3" '{ t = substr($0, 15, 24); if (t >= a && t <= b) print }' |
+grep -E '^\{"timestamp":"[^"]*",("ordinal":[0-9]+,)?"type":"(response_item","payload":\{"type":"(message|reasoning|function_call|custom_tool_call|local_shell_call|web_search_call)"|event_msg","payload":\{"type":"(token_count|item_completed)")' |
+grep -v -E '"payload":\{"type":"(message"(,"id":"[^"]*")?,"role":"developer"|reasoning"(,"id":"[^"]*")?,"summary":\[\])|"item":\{"type":"(Reasoning|UserMessage|AgentMessage)"' |
+sed -E 's/"encrypted_content":"[^"]*"/"encrypted_content":null/g; s/"aggregated_output":"(\\.|[^"\\])*"/"aggregated_output":""/g; /"item":\{"type":"(FileChange|McpToolCall|Extension)"/ s/"(content|unified_diff|snippet|text|stdout)":"(\\.|[^"\\])*"/"\1":""/g' |
+head -c $4`;
 
-// kimi keeps its sessions in $KIMI_SHARE_DIR/sessions, else ~/.kimi/sessions.
-const KIMI_ROOT = String.raw`if [ -n "$KIMI_SHARE_DIR" ]; then root="$KIMI_SHARE_DIR/sessions"; else root="$2/.kimi/sessions"; fi; `;
-// A tool's output is most of the file and nothing we show: only whether it failed is kept.
-const KIMI_LOG = KIMI_ROOT + String.raw`f=$(find "$root" -mindepth 3 -maxdepth 3 -path "*/$1/wire.jsonl" 2>/dev/null | head -n 1); [ -n "$f" ] || exit 1; sed -E '/"type": "ToolResult", "payload"/s/^\{"timestamp": ([0-9.eE+-]+),.*"tool_call_id": "([^"]*)".*"is_error": (true|false).*$/{"timestamp": \1, "message": {"type": "ToolResult", "payload": {"tool_call_id": "\2", "is_error": \3}}}/' "$f"`;
-// Sessions written to since the run began: each with the times its turns began.
-// First line: the md5 of the run's folder, which names kimi's folder for it.
-const KIMI_FIND = KIMI_ROOT + String.raw`printf '%s' "$3" | md5sum 2>/dev/null | cut -c1-32; find "$root" -mindepth 3 -maxdepth 3 -name wire.jsonl -newermt "@$4" 2>/dev/null | while read -r f; do printf '%s\t%s\n' "$f" "$(grep '"type": "TurnBegin"' "$f" | sed -E 's/^\{"timestamp": ([0-9.eE+-]+),.*/\1/' | tr '\n' ' ')"; done`;
+const KIMI_ROOT = String.raw`root=$KIMI_CODE_HOME; [ -n "$root" ] || root=$HOME/.kimi-code; root=$root/sessions
+`;
+// As CODEX_FIND: F <session folder>, its state.json (its folder), the times its turns began.
+const KIMI_FIND = KIMI_ROOT + String.raw`(cd "$2" 2>/dev/null && pwd -P) || echo
+find "$root" -mindepth 5 -maxdepth 5 -path "*/agents/main/wire.jsonl" -newermt "@$1" 2>/dev/null | while IFS= read -r f; do
+  d=$(dirname "$(dirname "$(dirname "$f")")")
+  printf 'F\t%s\n' "$d"
+  tr -d '\n' < "$d/state.json" 2>/dev/null | cut -c1-3000; echo
+  grep '^{"type":"turn.prompt"' "$f" | sed -E 's/.*"time":([0-9]+)\}$/\1/' | tr '\n' ' '; echo
+done`;
 
-async function kimiLog(id) {
-  if (!SESSION_ID.test(id)) return null;
-  const r = await exec("sh", ["-c", KIMI_LOG, "sh", id, home()]);
-  return r.code === 0 && r.stdout ? readWire(r.stdout) : null;
-}
+// A session's lines between two times ($2, $3: ms), of the kinds read here.
+const KIMI_LOG = KIMI_ROOT + String.raw`f=$(find "$root" -mindepth 5 -maxdepth 5 -path "*/$1/agents/main/wire.jsonl" 2>/dev/null | head -n 1)
+[ -n "$f" ] || exit 3
+grep -E '^\{"type":"(turn\.prompt|turn\.ended|context\.append_loop_event)"' "$f" |
+awk -v a="$2" -v b="$3" '{ if (match($0, /"time":[0-9]+\}$/)) { t = substr($0, RSTART + 7, RLENGTH - 8) + 0; if (t < a || t > b) next } print }' |
+sed -E '/"event":\{"type":"tool\.result"/ s/"output":"(\\.|[^"\\])*"/"output":""/; /"event":\{"type":"tool\.call"/ s/"(content|old_string|new_string)":"(\\.|[^"\\])*"/"\1":""/g' |
+head -c $4`;
 
-// The kimi session one of whose turns began within two minutes of the run, preferring
-// the run's own folder.
-async function kimiMatch(run) {
-  if (run.created_ms == null) return null;
-  const since = Math.floor((run.created_ms - 120000) / 1000);
-  const r = await exec("sh", ["-c", KIMI_FIND, "sh", "", home(), run.cwd ?? "", String(since)]);
-  const [hash, ...lines] = r.stdout.split("\n");
-  let best = null;
+// While a run was alive, give or take: a turn that began then is that run's.
+const alive = (run) => [run.created_ms - 5000, (run.finished_ms ?? Date.now()) + 5000];
+const jsonString = (s) => { try { return JSON.parse(`"${s}"`); } catch (_) { return s; } };
+
+// What a find script printed: the run's folder as its machine resolves it, and the
+// sessions written to since the run began, each { id, cwd, starts }.
+function candidates(out, read) {
+  const [real, ...lines] = out.split("\n");
+  const list = [];
+  let c = null;
   for (const l of lines) {
-    const [path, times] = l.split("\t");
-    const parts = (path ?? "").split("/");
-    const id = parts.at(-2);
-    if (!id || !SESSION_ID.test(id)) continue;
-    for (const ts of (times ?? "").trim().split(/\s+/)) {
-      const off = Math.abs(parseFloat(ts) * 1000 - run.created_ms);
-      if (!(off < 120000)) continue;
-      const score = off + (hash.trim() && parts.at(-3) === hash.trim() ? 0 : 120000);
-      if (!best || score < best.score) best = { id, score };
+    if (l.startsWith("F\t")) {
+      c = { path: l.slice(2), id: null, cwd: null, starts: [], first: true };
+      list.push(c);
+    } else if (c) {
+      read(c, l);
+      c.first = false;
     }
   }
-  return best?.id ?? null;
+  return { real: real.trim() || null, list };
 }
 
-const readLog = (agent, id) => (agent === "kimi" ? kimiLog(id) : codexLog(id));
+// The session a run left: in its folder, with a turn that began while it was alive;
+// of several, the one that began nearest the run's start. { id, cwd } or { note }.
+function pick(run, agent, { real, list }) {
+  const [from, to] = alive(run);
+  const here = list.filter((c) => c.id && c.cwd && (c.cwd === run.cwd || c.cwd === real));
+  let best = null;
+  for (const c of here) {
+    for (const t of c.starts) {
+      if (!(t >= from && t <= to)) continue;
+      const off = Math.abs(t - run.created_ms);
+      if (!best || off < best.off) best = { id: c.id, cwd: c.cwd, off };
+    }
+  }
+  if (best) return { id: best.id, cwd: best.cwd };
+  const where = machineOf(run.address) ? ` on ${machineOf(run.address)}` : "";
+  const why = !list.length ? `no ${NAME[agent]} session was written to since it began`
+    : !here.length ? `${list.length} ${NAME[agent]} ${list.length === 1 ? "session was" : "sessions were"} active then, none in this run's folder`
+      : `the ${NAME[agent]} ${here.length === 1 ? "session" : "sessions"} in its folder took no request while it ran`;
+  return { id: null, note: `${NAME[agent]}'s own log of this run wasn't found${where}: ${why}.` };
+}
 
-async function terminalText(run) {
+// Looks for a run's session on its machine: { id, cwd } or { note }.
+const FIND = {
+  *codex(run) {
+    const r = yield sh(run, CODEX_FIND, [Math.floor((run.created_ms - 120000) / 1000), run.cwd ?? ""]);
+    return pick(run, "codex", candidates(r.stdout, (c, l) => {
+      if (c.first) {
+        // The session's first line: its id is in the file's name, its folder among the first fields.
+        c.id = c.path.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(_\d+)?\.jsonl/i)?.[1] ?? null;
+        const cwd = l.match(/"cwd":"((?:\\.|[^"\\])*)"/);
+        c.cwd = cwd ? jsonString(cwd[1]) : null;
+      }
+      const t = Date.parse(l.match(/^\{"timestamp":"([^"]+)"/)?.[1] ?? "");
+      if (t) c.starts.push(t);
+    }));
+  },
+  *kimi(run) {
+    const r = yield sh(run, KIMI_FIND, [Math.floor((run.created_ms - 120000) / 1000), run.cwd ?? ""]);
+    return pick(run, "kimi", candidates(r.stdout, (c, l) => {
+      if (c.first) {
+        c.id = c.path.split("/").pop();
+        if (!KIMI_ID.test(c.id)) c.id = null;
+        let state = null;
+        try { state = JSON.parse(l); } catch (_) {}
+        const cwd = state?.cwd ?? l.match(/"cwd":"((?:\\.|[^"\\])*)"/)?.[1];
+        c.cwd = cwd == null ? null : state ? cwd : jsonString(cwd);
+      } else c.starts.push(...l.trim().split(/\s+/).map(Number).filter(Boolean));
+    }));
+  },
+};
+
+// The rounds a run's session log has from while the run was alive.
+const READ = {
+  *codex(run, id, cwd) {
+    const [from, to] = alive(run);
+    const r = yield sh(run, CODEX_LOG, [id, new Date(from).toISOString(), new Date(to).toISOString(), LIMIT]);
+    return { ...readRollout(r.stdout, { cwd }), cut: r.stdout.length >= LIMIT };
+  },
+  *kimi(run, id, cwd) {
+    const [from, to] = alive(run);
+    const r = yield sh(run, KIMI_LOG, [id, from, to, LIMIT]);
+    return { ...readWire(r.stdout, { cwd }), cut: r.stdout.length >= LIMIT };
+  },
+};
+
+function* terminalText(run) {
   try {
-    const r = await hc(["read", run.address, "--lines", "1000", "--json"]);
+    const r = yield ["hc", ["read", run.address, "--lines", "1000", "--json"]];
     if (r.code !== 0) return { text: null, cut: false };
     const read = JSON.parse(r.stdout);
     return { text: (read.text ?? "").replace(/\s+$/, ""), cut: read.complete === false };
@@ -441,72 +582,87 @@ async function terminalText(run) {
   }
 }
 
-async function labelFile(run, key) {
+function* labelFile(run, key) {
   const path = label(run, key);
   if (!path) return null;
   try {
-    const text = await readTextFile(path, { on: machineOf(run.address) });
+    const text = yield ["file", path, machineOf(run.address)];
     return text?.trim() || null;
   } catch (_) {
     return null;
   }
 }
 
-/** Rounds oldest first: { at, end, run, request, answer, steps, work, tokens, transcript, cut, session, live }. */
-export async function loadConversation(runs, live = []) {
-  runs = await Promise.all(runs.map(fullRecord));
-  live = await Promise.all(live.map(fullRecord));
-  const rounds = [];
-  const logs = new Map(); // agent + session id -> its rounds from the log
-  const facts = [];
-  // One run that can't be read costs its own round's details, never the others'.
-  for (const run of runs) {
-    const agent = agentOf(run);
-    let term = { text: null, cut: false };
-    let session = label(run, "herdr.session") ?? sessionFromArgv(run.argv, agent);
+const NOTHING = { steps: null, work: [], tokens: null, cached: null, ended: null };
+const why = (e) => String(e?.message ?? e).split("\n")[0];
+
+/** One finished run's rounds: from its agent's log when there is one, else one round
+ * from its labels, command line and output, with a note saying what's missing. */
+export function* roundsSteps(k) {
+  const run = yield* recordSteps(k);
+  const agent = agentOf(run);
+  const where = machineOf(run.address) ? ` on ${machineOf(run.address)}` : "";
+  const term = yield* terminalText(run);
+  const asked = yield* labelFile(run, "herdr.request");
+  const answered = yield* labelFile(run, "herdr.answer");
+  let session = label(run, "herdr.session") ?? sessionFromArgv(run.argv, agent);
+  let logged = [];
+  let note = null;
+  // The folder its paths are shown within: the session's own, when it was looked up.
+  let folder = run.cwd;
+  if (agent && run.created_ms != null) {
     try {
-      term = await terminalText(run);
-      if (!session && agent === "codex") session = term.text?.match(CODEX_SESSION)?.[1] ?? (await codexMatch(run));
-      if (!session && agent === "kimi") session = await kimiMatch(run);
-      const key = `${agent}\u0000${session}`;
-      if (agent && session && !logs.has(key)) logs.set(key, (await readLog(agent, session).catch(() => null))?.rounds ?? []);
-    } catch (_) {}
-    facts.push({ run, term, session, agent, key: `${agent}\u0000${session}` });
-  }
-  const used = new Set();
-  const fromLog = (r) => ({ request: r.request, answer: r.answer, steps: r.steps, work: r.work ?? [], tokens: r.tokens ?? null });
-  for (const { run, term, session, agent, key } of facts) {
-    const base = { run, transcript: term.text, cut: term.cut, session, live: false };
-    try {
-      const from = (run.created_ms ?? 0) - 5000;
-      const to = (run.finished_ms ?? Date.now()) + 5000;
-      const logged = run.created_ms == null ? [] : (logs.get(key) ?? []).filter((r) => r.at != null && r.at >= from && r.at <= to);
-      const asked = await labelFile(run, "herdr.request");
-      const answered = await labelFile(run, "herdr.answer");
-      if (logged.length) {
-        logged.forEach((r, i) => {
-          used.add(r);
-          const last = i === logged.length - 1;
-          rounds.push({ ...base, ...fromLog(r), at: r.at, end: last ? run.finished_ms ?? r.end : r.end,
-            request: i === 0 && asked ? asked : r.request, answer: last && answered ? answered : r.answer });
-        });
-      } else {
-        rounds.push({ ...base, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: asked ?? requestFromArgv(run.argv, agent),
-          answer: answered, steps: null, work: [], tokens: null });
+      if (session && !ID[agent].test(session)) session = null;
+      if (!session && agent === "codex") session = term.text?.match(CODEX_SESSION)?.[1] ?? null;
+      const named = session;
+      let log = session ? yield* READ[agent](run, session, folder) : null;
+      // No session named, or the one named has nothing from this run (an id that was
+      // something else's): the one in the run's folder with a turn from while it ran.
+      if (!log?.rounds.length) {
+        const found = yield* FIND[agent](run);
+        if (found.id && found.id !== named) {
+          session = found.id;
+          folder = found.cwd ?? folder;
+          log = yield* READ[agent](run, session, folder);
+        } else if (!named) note = found.note;
       }
-    } catch (_) {
-      rounds.push({ ...base, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null, steps: null, work: [], tokens: null });
+      logged = log?.rounds ?? [];
+      if (session && !logged.length) note = `${NAME[agent]}'s log of session ${session.replace(/^session_/, "").slice(0, 8)}${where} has no request from while this ran.`;
+      else if (log?.cut) note = TOO_LONG;
+    } catch (e) {
+      note = `${NAME[agent]}'s own log of this run couldn't be read${where}: ${why(e)}`;
     }
   }
-  // Rounds of these sessions that ran outside Herdr, or in terminals the core forgot.
-  for (const [key, list] of logs) {
-    for (const r of list) {
-      if (!used.has(r)) rounds.push({ ...fromLog(r), at: r.at, end: r.end, run: null, transcript: null, cut: false, session: key.split("\u0000")[1], live: false });
-    }
+  const base = { run, transcript: term.text, cut: term.cut, session, live: false, note: null };
+  if (!logged.length) {
+    return [{ ...base, ...NOTHING, note, at: run.created_ms ?? null, end: run.finished_ms ?? null,
+      request: asked ?? requestFromArgv(run.argv, agent), answer: answered }];
   }
-  for (const run of live) {
-    rounds.push({ at: run.created_ms ?? null, end: null, run, request: (await labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv, agentOf(run)),
-      answer: null, steps: null, work: [], tokens: null, transcript: null, cut: false, session: label(run, "herdr.session"), live: true });
-  }
-  return rounds.sort((x, y) => (x.at ?? 0) - (y.at ?? 0));
+  return logged.map((r, i) => {
+    const last = i === logged.length - 1;
+    return { ...base, ...r, note: last ? note : null, end: last ? run.finished_ms ?? r.end : r.end,
+      request: i === 0 && asked ? asked : r.request, answer: last && answered ? answered : r.answer };
+  });
+}
+
+/** A run still going: its request, and that it's running. */
+export function* liveSteps(k) {
+  const run = yield* recordSteps(k);
+  return [{ ...NOTHING, run, at: run.created_ms ?? null, end: null, request: (yield* labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv, agentOf(run)),
+    answer: null, transcript: null, cut: false, session: label(run, "herdr.session"), note: null, live: true }];
+}
+
+// One run that can't be read costs its own round's details, never the others'.
+const unread = (run, e) => [{ ...NOTHING, run, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null,
+  transcript: null, cut: false, session: null, live: false, note: `This run couldn't be read: ${why(e)}` }];
+
+/** Each run's rounds as one conversation, oldest first. */
+export const inOrder = (lists) => lists.flat().sort(byTime);
+
+/** Rounds oldest first: { at, end, run, request, answer, steps, work, tokens, cached, ended, transcript, cut, session, note, live }. */
+export async function loadConversation(runs, live = []) {
+  return inOrder(await Promise.all([
+    ...runs.map((run) => drive(roundsSteps(run)).catch((e) => unread(run, e))),
+    ...live.map((run) => drive(liveSteps(run)).catch((e) => unread(run, e))),
+  ]));
 }
