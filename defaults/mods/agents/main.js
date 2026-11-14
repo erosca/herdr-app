@@ -1,9 +1,11 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
-// A viewed done agent stays in Done until left.
+// A viewed done agent stays in Done until left. Sub-agents that finished stay under
+// their agent in one folded "n finished" row while the core keeps them (a day after
+// their parent saw the result); clicking one shows its last output, dismissing hides it.
 
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc, settings } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -68,14 +70,283 @@ function icon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
 
+// Finished sub-agents are shown unless switched off in the sort menu.
+const showFinished = () => shared("agents.finished") !== false;
+
+// How a finished sub-agent ended, when that's worth a word: a clean exit says nothing.
+function ending(k) {
+  if (k.reason === "killed") return { text: "stopped", bad: false };
+  if (k.exit_code != null && k.exit_code !== 0) return { text: `exit ${k.exit_code}`, bad: true };
+  if (k.signal != null) return { text: `signal ${k.signal}`, bad: true };
+  if (k.exit_code == null && k.reason && k.reason !== "exited") return { text: "lost", bad: true };
+  return null;
+}
+
+function span(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function clock(ms) {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// The tooltip of a finished sub-agent: how it ended, how long it ran, when.
+function about(k) {
+  const how = ending(k)?.text ?? (k.exit_code === 0 ? "exit 0" : k.reason || "finished");
+  const ran = k.finished_ms != null && k.created_ms != null ? ` · ran ${span(k.finished_ms - k.created_ms)}` : "";
+  return `${how}${ran}${k.finished_ms != null ? ` · ended ${clock(k.finished_ms)}` : ""}`;
+}
+
+// The tree lines in front of a sub-row: one 13 px column per level.
+function connectors(t, lines) {
+  return lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
+    .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
+    .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6)));
+}
+
 export default class Agents extends View {
   init(_props, cx) {
+    if (props()?.output) return this.loadOutput(cx);
     if (props()?.sortMenu) return;
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
     this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
     this.pins = JSON.parse(localStorage.getItem("pins") ?? "[]");
     cx.timer.every(30000, (cx) => cx.notify());
+    // Finished sub-agents: terminals() lists live terminals only, so they come from
+    // the core, asked again when a sub-agent ends and every 5 minutes.
+    this.done = [];
+    this.doneAt = 0;
+    this.doneDirty = true;
+    this.openDone = new Set();
+    this.dismissed = new Set(JSON.parse(localStorage.getItem("dismissed") ?? "[]"));
+    // A sub-agent's program and name, kept from while it ran: the core's record has neither.
+    this.progs = JSON.parse(localStorage.getItem("progs") ?? "{}");
+    cx.timer.every(2000, (cx) => {
+      if (showFinished() && (this.doneDirty || Date.now() - this.doneAt > 300000)) this.loadDone(cx);
+    });
+  }
+
+  loadDone(cx) {
+    if (this.loading) return;
+    this.loading = true;
+    this.doneDirty = false;
+    cx.spawn(async (cx) => {
+      try {
+        const r = await hc(["ls", "--all", "--json"]);
+        if (r.code !== 0) return;
+        const list = JSON.parse(r.stdout).terminals ?? [];
+        this.done = list.filter((k) => k.state === "finished" && k.parent);
+        this.forget(list);
+      } catch (_) {
+        // Keep the last list: a core that's restarting answers again soon.
+      } finally {
+        this.loading = false;
+        this.doneAt = Date.now();
+        cx.notify();
+      }
+    });
+  }
+
+  // Drops dismissals and names of terminals the core no longer has. Only for machines
+  // that answered: one that's offline leaves its terminals out of the list.
+  forget(list) {
+    const machine = (addr) => (addr.includes("/") ? addr.split("/")[0] : "");
+    const heard = new Set(list.map((k) => machine(k.address)));
+    const known = new Set(list.map((k) => k.address));
+    const gone = (addr) => heard.has(machine(addr)) && !known.has(addr);
+    const dismissed = [...this.dismissed].filter((a) => !gone(a));
+    if (dismissed.length !== this.dismissed.size) {
+      this.dismissed = new Set(dismissed);
+      localStorage.setItem("dismissed", JSON.stringify(dismissed));
+    }
+    const progs = Object.keys(this.progs).filter(gone);
+    for (const a of progs) delete this.progs[a];
+    if (progs.length) localStorage.setItem("progs", JSON.stringify(this.progs));
+  }
+
+  // Keeps each running sub-agent's program and name, and notices one that ended.
+  remember(all) {
+    let changed = false;
+    const kids = new Set();
+    for (const k of all) {
+      if (!k.parent || k.state !== "live") continue;
+      kids.add(k.address);
+      if (!k.program) continue;
+      const name = k.name || k.template || k.program.name;
+      const was = this.progs[k.address];
+      if (was && was.n === name && was.p?.key === k.program.key) continue;
+      this.progs[k.address] = { p: k.program, n: name };
+      changed = true;
+    }
+    if (changed) localStorage.setItem("progs", JSON.stringify(this.progs));
+    if (this.kids && [...this.kids].some((a) => !kids.has(a))) this.doneDirty = true;
+    this.kids = kids;
+  }
+
+  // When each live sub-agent's state last changed (ms): stopping work stamps its end.
+  // After a restart, the core's status_ms; the app doesn't keep that field current.
+  stampKids(all, now) {
+    const kidAt = {};
+    for (const k of all) {
+      if (!k.parent || k.state !== "live") continue;
+      const s = kidStatus(k, this.listed);
+      const was = this.kidAt?.[k.address];
+      kidAt[k.address] = !was ? { s, at: k.status_ms ?? k.created_ms ?? now } : was.s !== s ? { s, at: now } : was;
+    }
+    this.kidAt = kidAt;
+  }
+
+  // Finished sub-agents of a listed agent and of its live sub-agents, newest first.
+  doneOf(addr, subs) {
+    if (!showFinished()) return [];
+    const owners = new Set([addr, ...subs.map((s) => s.t.address)]);
+    return this.done
+      .filter((k) => owners.has(k.parent) && !this.dismissed.has(k.address))
+      .sort((x, y) => (y.finished_ms ?? 0) - (x.finished_ms ?? 0));
+  }
+
+  dismiss(addrs) {
+    for (const a of addrs) this.dismissed.add(a);
+    localStorage.setItem("dismissed", JSON.stringify([...this.dismissed]));
+  }
+
+  // Tracks the row under the pointer, for controls shown only on hover.
+  hoverable(el, id) {
+    return el.on_hover((on, cx) => {
+      if (on) this.hovered = id;
+      else if (this.hovered === id) this.hovered = null;
+      cx.notify();
+    });
+  }
+
+  dismissButton(t, id, tip, addrs) {
+    return div()
+      .id(id)
+      .flex_none()
+      .ml(6)
+      .p(2)
+      .rounded(4)
+      .text_color(t.dim)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(tip)
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        this.dismiss(addrs);
+        this.hovered = null;
+        cx.notify();
+      })
+      .child(svg("mods/workspace-chrome/x.svg").size(12));
+  }
+
+  // The folded row under an agent: how many of its sub-agents finished, and how many failed.
+  doneHeader(t, a, done, open) {
+    const id = `done-${a.address}`;
+    const failed = done.filter((k) => ending(k)?.bad).length;
+    return this.hoverable(h_flex().id(id), id)
+      .pl(39)
+      .pr(8)
+      .rounded(8)
+      .h(26)
+      .flex_none()
+      .items_center()
+      .text_size(12)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => {
+        open ? this.openDone.delete(a.address) : this.openDone.add(a.address);
+        cx.notify();
+      })
+      .children(connectors(t, ["└"]))
+      .child(h_flex().w(14).mr(8).flex_none().justify_center()
+        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim)))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${done.length} finished`))
+      .when(failed > 0, (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(t.blocked).child(`${failed} failed`)))
+      .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`, "Clear finished", done.map((k) => k.address))));
+  }
+
+  // One finished sub-agent: dimmed, how it ended if not cleanly, and since when.
+  doneRow(t, k, lines, now) {
+    const id = `fin-${k.address}`;
+    const known = this.progs[k.address];
+    const prog = k.program ?? known?.p;
+    const pic = icon(prog, 14, t.dim);
+    const end = ending(k);
+    const name = k.name || k.template || known?.n || prog?.name || k.address;
+    return this.hoverable(h_flex().id(id), id)
+      .pl(39)
+      .pr(8)
+      .rounded(8)
+      .h(26)
+      .flex_none()
+      .items_center()
+      .text_size(12.5)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .tooltip(about(k))
+      .on_click(() => openOverlay({ mod: "agents", kind: "dialog", width: 760, height: 520, props: { output: k.address, name, about: about(k) } }))
+      .children(connectors(t, lines))
+      .child(div().w(14).mr(8).flex_none().opacity(0.55).when(Boolean(pic), (el) => el.child(pic)))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(name))
+      .when(Boolean(end), (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(end.bad ? t.blocked : t.dim).child(end.text)))
+      .child(this.hovered === id
+        ? this.dismissButton(t, `x-${k.address}`, "Dismiss", [k.address])
+        : div().flex_none().ml(6).text_size(11).text_color(t.dim).child(k.finished_ms != null ? duration(now - k.finished_ms) : ""));
+  }
+
+  // The output dialog: what a finished sub-agent printed last, read-only.
+  loadOutput(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const r = await hc(["read", props().output, "--lines", "1000", "--json"]);
+        let text = r.stdout;
+        try { text = JSON.parse(r.stdout).text ?? ""; } catch (_) {}
+        text = text.replace(/\s+$/, "");
+        if (r.code !== 0) this.outputError = "Herdr-core no longer has this output.";
+        else if (!text) this.outputError = "It printed nothing.";
+        else this.code = EditorState.new({ language: "text", value: text, readonly: true, line_numbers: false, folding: false,
+          font_family: settings().font_family, font_size: 12 });
+      } catch (_) {
+        this.outputError = "Couldn't read its output.";
+      } finally {
+        cx.notify();
+      }
+    });
+  }
+
+  outputView(t) {
+    const p = props();
+    return v_flex()
+      .size_full()
+      .bg(t.surface)
+      .child(h_flex()
+        .h(38)
+        .px(14)
+        .gap(8)
+        .flex_none()
+        .items_center()
+        .border_b(1)
+        .border_color(t.border)
+        .child(div().min_w(0).truncate().text_size(13).font_medium().text_color(t.foreground).child(p.name))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(p.about ?? ""))
+        .child(div()
+          .id("output-close")
+          .p(3)
+          .rounded(4)
+          .text_color(t.dim)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => closeOverlay(p.overlay))
+          .child(svg("mods/workspace-chrome/x.svg").size(13))))
+      .child(this.code
+        ? Editor.new(this.code).flex_1().min_h(0)
+        : div().p(14).text_size(12).text_color(t.dim).child(this.outputError ?? "Loading…"));
   }
 
   // Stamps agents whose state changed. Done and idle count as one: looking at a
@@ -151,7 +422,24 @@ export default class Agents extends View {
         })
         .child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().child(s.label))
-        .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
+        .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))))
+      .child(div().mx(8).my(4).h(1).bg(t.border))
+      .child(h_flex()
+        .id("show-finished")
+        .h(31)
+        .px(8)
+        .gap(9)
+        .rounded(7)
+        .items_center()
+        .text_color(t.foreground)
+        .hover((el) => el.bg(t.hover))
+        .on_click(() => {
+          setShared("agents.finished", !showFinished());
+          closeOverlay(props().overlay);
+        })
+        .child(svg("mods/workspace-chrome/circle-check.svg").size(14).flex_none().text_color(t.muted))
+        .child(div().flex_1().child("Finished sub-agents"))
+        .when(showFinished(), (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground))));
   }
 
   peek(addr) {
@@ -159,10 +447,15 @@ export default class Agents extends View {
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
-  tree(all, addr, lead = []) {
-    const kids = all.filter((k) => k.parent === addr && k.state === "live");
+  // `more`: a row follows the last one (the finished row), so its line goes on.
+  tree(all, addr, lead = [], more = false) {
+    // Newest end of work first: those still working (no end yet) on top, then the one
+    // that stopped most recently. Finished ones follow in their own row, by when they ended.
+    const at = (k) => this.kidAt?.[k.address]?.at ?? 0;
+    const busy = (k) => (kidStatus(k, this.listed) === "working" ? 1 : 0);
+    const kids = all.filter((k) => k.parent === addr && k.state === "live").sort((x, y) => busy(y) - busy(x) || at(y) - at(x));
     return kids.flatMap((k, i) => {
-      const last = i === kids.length - 1;
+      const last = i === kids.length - 1 && !more;
       return [
         { t: k, lines: [...lead, last ? "└" : "├"] },
         ...this.tree(all, k.address, [...lead, last ? "" : "│"]),
@@ -188,9 +481,7 @@ export default class Agents extends View {
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
       .on_click(() => this.peek(k.address))
-      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
-        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
-        .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
+      .children(connectors(t, s.lines))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
       .child(this.status(t, { status: st }, compact));
@@ -209,14 +500,17 @@ export default class Agents extends View {
 
   render(cx) {
     const t = theme();
+    if (props()?.output) return this.outputView(t);
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
     const sort = sortOf();
     let list = agents();
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
+    this.remember(all);
     const shown = focused()?.agent;
     const now = Date.now();
+    this.stampKids(all, now);
     this.track(list, now);
     this.hold(list);
     const byPriority = sort.id === "priority";
@@ -230,10 +524,19 @@ export default class Agents extends View {
     setAgentOrder(list.map((a) => a.address));
 
     const withKids = (a, i) => {
-      const subs = collapsed ? [] : this.tree(all, a.address);
+      let subs = collapsed ? [] : this.tree(all, a.address);
+      // Finished ones go last, in one folded row; the live tree's line runs on to it.
+      const done = collapsed ? [] : this.doneOf(a.address, subs);
+      if (done.length) subs = this.tree(all, a.address, [], true);
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
-      return [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority))];
+      const rows = [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority))];
+      if (done.length) {
+        const open = this.openDone.has(a.address);
+        rows.push(this.doneHeader(t, a, done, open));
+        if (open) rows.push(...done.map((k, j) => this.doneRow(t, k, ["", j === done.length - 1 ? "└" : "├"], now)));
+      }
+      return rows;
     };
 
     // The fold chevron; folded, the count too, colored by the most urgent one.
@@ -417,7 +720,7 @@ export default class Agents extends View {
                 .text_size(11)
                 .text_color(t.dim)
                 .hover((s) => s.text_color(t.foreground))
-                .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
+                .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 200, height: 180, props: { sortMenu: true } }))
                 .tooltip(`Sort agents: ${sort.label}`)
                 .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
             ),

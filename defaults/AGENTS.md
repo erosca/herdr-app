@@ -155,6 +155,10 @@ the highlighted line shows where it will land.
   records the starter as `parent` (see `terminals()`). They belong to their
   parent's tab without a pane; the `agents` mod shows them,
   `terminal.peek` opens one, `terminal.keep` gives one a pane.
+  `terminals()` lists live terminals only; the `agents` mod gets finished
+  sub-agents from `hc ls --all --json` and shows them in one folded "n finished"
+  row under their agent while the core keeps them (clicking one shows its last
+  output, hovering offers dismiss; shared `"agents.finished": false` hides them).
   Ctrl-click (Cmd-click on macOS) a live terminal address in terminal text to
   peek at it. Bare addresses refer to the machine of the terminal showing them;
   use `machine/address` for another machine. Names and non-live addresses aren't links.
