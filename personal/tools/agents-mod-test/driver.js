@@ -6,13 +6,16 @@
 //     to run and ask again;
 //   - MODE "report" throws what each case came to, for check.py to compare;
 //   - MODE "view" renders one case's conversation window for real: a wrong element
-//     method or argument fails the check.
+//     method or argument fails the check;
+//   - MODE "watch" renders the bar over a running sub-agent's live terminal, with the
+//     request WATCH (null: none was recorded).
 
 import { View } from "gpui-kit";
 import { theme } from "herdr";
 import * as thread from "./thread.js";
 import { initConversation, conversationView } from "./conversation.js";
-import { CASES, ANSWERS, MODE, VIEW, OPEN } from "./cases.js";
+import { initWatch, watchView } from "./watch.js";
+import { CASES, ANSWERS, MODE, VIEW, OPEN, WATCH } from "./cases.js";
 
 const NEED = {};
 
@@ -60,15 +63,18 @@ function looks(k, c, needs, asked) {
 function run(c, needs) {
   if (c.call) return { name: c.name, result: thread[c.call](...c.args) };
   const asked = [];
+  // What was asked of the app, without the scripts: which kind, of which machine.
+  const place = (q) => (q[0] === "hc" ? `hc ${q[1][0]} ${q[1][1]}` : q[0] === "sh" ? `sh ${q[3] ?? "here"} ${q[2][0]}` : `file ${q[2] ?? "here"} ${q[1]}`);
   try {
+    // What a running one was asked, as the bar over its terminal looks it up.
+    if (c.ask) return { name: c.name, report: { name: c.name, result: replay(thread.requestSteps(c.ask), needs, asked), asked: asked.map(place) } };
     const live = (c.live ?? []).map((k) => looks(k, c, needs, asked));
     const lists = [
       ...(c.runs ?? []).map((k) => replay(thread.roundsSteps(k), needs, asked)),
       ...live.map((all) => all[all.length - 1]),
     ];
     const rounds = thread.inOrder(lists);
-    // What was asked of the app, without the scripts: which kind, of which machine.
-    const where = asked.map((q) => (q[0] === "hc" ? `hc ${q[1][0]} ${q[1][1]}` : q[0] === "sh" ? `sh ${q[3] ?? "here"} ${q[2][0]}` : `file ${q[2] ?? "here"} ${q[1]}`));
+    const where = asked.map(place);
     // Each look at the first running one: what its last round had by then.
     const seen = (live[0] ?? []).map((rs) => {
       const r = rs[rs.length - 1];
@@ -85,21 +91,28 @@ export default class Driver extends View {
   init(_props, cx) {
     this.needs = [];
     this.done = CASES.map((c) => run(c, this.needs));
+    if (MODE === "watch") {
+      const c = CASES[VIEW];
+      return initWatch(this, cx, { watch: { thread: c.thread, runs: c.runs ?? [], live: (c.live ?? c.runs)[0] }, request: WATCH, overlay: "check" });
+    }
     if (MODE !== "view" || this.needs.length) return;
     const c = CASES[VIEW];
     const rounds = this.done[VIEW].rounds;
     initConversation(this, cx, { thread: c.thread, runs: c.runs ?? [], live: c.live ?? [], rounds, overlay: "check" });
     if (OPEN == null) return;
-    // One round open with everything in it unfolded: its whole request, its steps, its terminal output.
+    // One round open with everything in it unfolded: its whole request, its steps (each
+    // to its whole text), its terminal output.
     this.open = rounds[OPEN].key;
     for (const r of rounds) {
       this.full.add(r.key);
       this.work.add(r.key);
       if (r.transcript) this.term.add(r.key);
+      (r.work ?? []).forEach((_, j) => this.steps.add(`${r.key}-${j}`));
     }
   }
 
   render() {
+    if (MODE === "watch") return watchView(this, theme());
     if (this.needs.length) throw new Error(`NEED ${JSON.stringify(this.needs)}`);
     if (MODE === "report") throw new Error(`REPORT ${JSON.stringify(this.done.map((d) => d.report ?? { name: d.name, result: d.result }))}`);
     return conversationView(this, theme());

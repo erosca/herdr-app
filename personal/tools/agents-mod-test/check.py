@@ -55,14 +55,14 @@ def engine(folder):
     return r.returncode == 0, r.stdout + r.stderr
 
 
-def build(folder, cases, answers, mode, view=None, opened=None):
+def build(folder, cases, answers, mode, view=None, opened=None, watch=None):
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
-    for name in ("thread.js", "conversation.js", "util.js", "mod.json"):
+    for name in ("thread.js", "conversation.js", "watch.js", "util.js", "mod.json"):
         shutil.copy(os.path.join(MOD, name), folder)
     shutil.copy(os.path.join(HERE, "driver.js"), os.path.join(folder, "main.js"))
     with open(os.path.join(folder, "cases.js"), "w") as f:
-        for name, value in (("CASES", cases), ("ANSWERS", answers), ("MODE", mode), ("VIEW", view), ("OPEN", opened)):
+        for name, value in (("CASES", cases), ("ANSWERS", answers), ("MODE", mode), ("VIEW", view), ("OPEN", opened), ("WATCH", watch)):
             f.write("export const %s = %s;\n" % (name, json.dumps(value)))
 
 
@@ -147,6 +147,14 @@ def views(folder, cases, answers, reports, which):
             check(ok, "the engine draws \"%s\", %s" % (cases[i]["name"], how), None if ok else text.strip()[:1200])
 
 
+def watches(folder, cases, i):
+    """The bar over a running sub-agent's live terminal: before its request is known, with none, a short one, a long one."""
+    for what, request in (("no request recorded", None), ("a short request", "Check it."), ("a long request", "\n".join("line %d of the brief" % n for n in range(120)))):
+        build(folder, cases, {}, "watch", i, None, request)
+        ok, text = engine(folder)
+        check(ok, "the engine draws the bar over \"%s\"'s live terminal, %s" % (cases[i]["name"], what), None if ok else text.strip()[:1200])
+
+
 def slim(step):
     return {k: v for k, v in step.items() if k != "detail" and v is not None}
 
@@ -173,6 +181,9 @@ def fixture_cases(fx):
          "thread": thread("review-kimi", KIMI, ["t40", "t41", "t90"])},
         {"name": "a codex run still going, looked at three times", "live": [short("vm/t91")], "looks": 3, "thread": thread("review-live", CODEX, ["vm/t91"])},
         {"name": "a kimi run still going", "live": [short("t92", KIMI)], "thread": thread("review-kimi-live", KIMI, ["t92"])},
+        {"name": "asked: a label", "ask": short("vm/t91")},
+        {"name": "asked: on the command line", "ask": short("t90", KIMI)},
+        {"name": "asked: through a wrapper", "ask": short("t92", KIMI)},
         {"name": "agentOf", "call": "agentOf", "args": [{"argv": [wrapper, "codex", "/w", "/b.md", "/r.md"]}]},
         {"name": "agentOf: a script", "call": "agentOf", "args": [{"argv": ["sh", "-c", "cd w && ~/.kimi-code/bin/kimi -p hi"]}]},
         {"name": "agentOf: what Herdr saw running", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": CODEX}]},
@@ -324,6 +335,12 @@ def expect(fx, reports, answers):
           "what it said is kept whole, for the window to show as Markdown")
 
     result = lambda name: by[name].get("result")
+    check((result("asked: a label"), asked("asked: a label")) == (fixtures.LREQUEST, ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]]),
+          "what a running one was asked, for the bar over its terminal: from its label's file, its log not read", asked("asked: a label"))
+    check((result("asked: on the command line"), asked("asked: on the command line")) == ("One more: check the docs as well.", ["hc get t90"]),
+          "from its command line, nothing else asked", asked("asked: on the command line"))
+    check(result("asked: through a wrapper") == "Look at the docs." and [a.split(" ")[0] for a in asked("asked: through a wrapper")] == ["hc", "hc", "sh", "sh"],
+          "through a wrapper, with no label: from its agent's log", [result("asked: through a wrapper"), asked("asked: through a wrapper")])
     check([result(n) for n in ("agentOf", "agentOf: a script", "agentOf: what Herdr saw running", "agentOf: not an agent")] == ["codex", "kimi", "codex", None],
           "whose log to look for: a wrapper's first argument, a script's words, what Herdr saw running; not any argument")
     check([result(n) for n in ("requestFromArgv: codex", "requestFromArgv: kimi", "requestFromArgv: a script")] == ["Review the patch in /tmp/r1.diff please", "Check it", None],
@@ -376,6 +393,7 @@ def main():
             expect(fx, reports, answers)
             print("     (scripts for vm/... ran %s)" % ("through hc exec" if core else "directly: no herdr-core to go through"))
             views(folder, cases, answers, reports, [i for i, c in enumerate(cases) if "thread" in c])
+            watches(folder, cases, next(i for i, c in enumerate(cases) if c.get("live") and not c.get("runs")))
     print("%d failed" % failed if failed else "all passed")
     sys.exit(1 if failed else 0)
 
