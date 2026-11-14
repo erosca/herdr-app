@@ -4,7 +4,11 @@ logs on a machine that runs both), with made-up content, and the runs that left 
 make(root) writes them under root and returns what check.py needs: the homes to point
 CODEX_HOME and KIMI_CODE_HOME at, each run's record as `hc get` gives it, and each
 run's terminal text as `hc read` gives it. Times are relative to now, and each file's
-modified time is its session's end, as on a real machine."""
+modified time is its session's end, as on a real machine.
+
+Two runs are still going. The codex one's log is written in three goes (`live_file`,
+then `stages`: what check.py appends before the second and the third look), the first
+of them ending in the middle of a line, as a log does while it is written."""
 
 import json
 import os
@@ -15,6 +19,9 @@ DECOY = "01a1d7eb-0000-7c71-bd79-b00a0302c0ea"
 OLD = "0199a213-81c0-7800-8aa1-bbab2c41ebaf"    # a codex session in the format before 0.167
 KID = "session_dab28818-7fd5-4a02-9d9e-14f554205bab"
 KDECOY = "session_aaaaaaaa-0000-4000-8000-000000000000"
+LIVE = "01a1d7eb-1111-7c71-bd79-b00a0302c0ea"    # a codex session still being written
+KLIVE = "session_bbbbbbbb-1111-4000-8000-000000000000"
+LREQUEST = "Check the parser.\nBe thorough."
 WRAPPER = "/home/u/.claude/skills/external-review/run-reviewer.sh"
 REQUEST = "Review the patch in r1.diff for bugs.\n\n<notes>\nKeep it short.\n</notes>"
 ANSWER = "## Findings\n- an off-by-one in `parse`"
@@ -110,6 +117,47 @@ def second_turn(add, item, user, said, tokens, command, _n):
     add(360, "event_msg", {"type": "task_complete", "turn_id": "turn2", "last_agent_message": "Tests look fine."})
 
 
+def live_turn(cwd):
+    """A turn as it is written while it goes on; check.py's three looks see it grow."""
+    def turn(add, item, user, said, tokens, command, _n):
+        add(1, "event_msg", {"type": "task_started", "turn_id": "turn", "started_at": 0})
+        user(2, "Check the parser, as it was sent.", ["user.text"])
+        said(3, "Starting with the **parser**.", "commentary")
+        command(4, "cat src/parse.rs", [{"type": "read", "cmd": "cat src/parse.rs", "name": "parse.rs", "path": "src/parse.rs"}])
+        tokens(5, 1000, 2000, 100)
+        # The first look ends here (10 lines); the second gets the next command and half of the edit's line.
+        command(20, "cargo check", [{"type": "unknown", "cmd": "cargo check"}], secs=3)
+        item(30, {"type": "FileChange", "id": "exec-2", "changes": {cwd + "/src/parse.rs": {"type": "update", "unified_diff": BIG, "move_path": None}}, "status": "completed", "stdout": "", "stderr": ""}, 40)
+        tokens(40, 500, 4000, 60)
+        said(45, "Parser is fine.", "final_answer")
+        add(46, "event_msg", {"type": "task_complete", "turn_id": "turn", "last_agent_message": "Parser is fine."})
+    return turn
+
+
+def kimi_live_session(t0, cwd):
+    """A wire.jsonl whose turn isn't over: sixteen steps so far, its last text half an answer."""
+    lines = [compact({"type": "metadata", "protocol_version": "1.5", "created_at": int(t0 * 1000)})]
+
+    def add(dt, kind, **rest):
+        lines.append(compact({"type": kind, **rest, "time": int((t0 + dt) * 1000)}))
+
+    def loop(dt, **event):
+        add(dt, "context.append_loop_event", agentId="main", event=event)
+
+    add(1, "turn.prompt", agentId="main", input=[{"type": "text", "text": "Look at the docs."}], origin={"kind": "user"}, promptId="msg_1", turnId=0)
+    loop(2, type="step.begin", uuid="s1", turnId="0", step=1)
+    loop(3, type="content.part", uuid="p1", turnId="0", step=1, part={"type": "think", "think": "Docs first."})
+    loop(3, type="content.part", uuid="p2", turnId="0", step=1, part={"type": "text", "text": "Looking at the docs, *all* of them."})
+    for n in range(14):
+        loop(4 + n, type="tool.call", uuid="u%d" % n, turnId="0", step=1, stepUuid="s", toolCallId="tool_%d" % n, name="Read",
+             args={"path": "docs/%d.md" % n}, display={"kind": "file_io", "operation": "read", "path": "%s/docs/%d.md" % (cwd, n)})
+        loop(4 + n, type="tool.result", parentUuid="u%d" % n, toolCallId="tool_%d" % n, result={"output": BIG, "durationMs": 7})
+    loop(20, type="step.end", uuid="s1", turnId="0", step=1, finishReason="tool_use", usage={"inputOther": 800, "output": 200, "inputCacheRead": 5000, "inputCacheCreation": 0})
+    loop(21, type="step.begin", uuid="s2", turnId="0", step=2)
+    loop(22, type="content.part", uuid="p3", turnId="0", step=2, part={"type": "text", "text": "Half an ans"})
+    return lines
+
+
 def old_codex_session(t0, sid, cwd):
     """Before 0.167: no ordinal, no item_completed; the calls themselves are all there is."""
     def line(dt, kind, payload):
@@ -191,7 +239,8 @@ def make(root):
     told = round(now - 3000)
     ws = os.path.join(root, "ws")
     cws, kws, link = os.path.join(ws, "codex-ws"), os.path.join(ws, "kimi-ws"), os.path.join(ws, "link")
-    for d in (cws, kws, os.path.join(ws, "empty"), os.path.join(ws, "old")):
+    lws, klws = os.path.join(ws, "live-ws"), os.path.join(ws, "kimi-live")
+    for d in (cws, kws, lws, klws, os.path.join(ws, "empty"), os.path.join(ws, "old")):
         os.makedirs(d)
     os.symlink(cws, link)   # the run's folder as herdr-core has it; codex records where it leads
 
@@ -202,8 +251,18 @@ def make(root):
     write("%s/sessions/%s/rollout-%s-%s.jsonl" % (codex, day, stamp, DECOY), codex_session(t0, DECOY, "/somewhere/else", [first_turn("/somewhere/else")]), t0 + 80)
     write("%s/sessions/%s/rollout-%s-%s.jsonl" % (codex, day, stamp, OLD), old_codex_session(told, OLD, os.path.join(ws, "old")), told + 41)
 
+    # A codex run still going, begun a minute ago: its log so far, and what is written next.
+    tl = round(now - 60)
+    going = codex_session(tl, LIVE, lws, [live_turn(lws)])
+    live_file = "%s/sessions/%s/rollout-%s-%s.jsonl" % (codex, time.strftime("%Y/%m/%d", time.localtime(tl)), time.strftime("%Y-%m-%dT%H-%M-%S", time.localtime(tl)), LIVE)
+    write(live_file, going[:10], now)
+    half = len(going[13]) // 2
+    stages = ["\n".join(going[10:13]) + "\n" + going[13][:half], going[13][half:] + "\n" + "\n".join(going[14:]) + "\n"]
+
     kimi = os.path.join(root, "kimi")
+    tk = round(now - 40)
     for folder, kid, cwd, lines, end in (("wd_kimi-ws_8653ff5eb128", KID, kws, kimi_session(t0, kws), t0 + 322),
+                                         ("wd_kimi-live_111111111111", KLIVE, klws, kimi_live_session(tk, klws), now),
                                          ("wd_other_000000000000", KDECOY, "/somewhere/else", kimi_session(t0, "/somewhere/else"), t0 + 322)):
         d = "%s/sessions/%s/%s" % (kimi, folder, kid)
         write(d + "/agents/main/wire.jsonl", lines, end)
@@ -214,6 +273,7 @@ def make(root):
     files = os.path.join(root, "files")
     write(files + "/req.md", ["Please review.", "Carefully."], t0)
     write(files + "/ans.md", ["**LGTM**"], t0)
+    write(files + "/live-req.md", LREQUEST.split("\n"), now)
 
     def record(address, name, argv, cwd, start, end, **more):
         return {"address": address.split("/")[-1], "name": name, "labels": {"where": "vm / 1"}, "argv": argv, "cwd": cwd, "keep": False, "state": "finished",
@@ -236,5 +296,9 @@ def make(root):
         "t80": record("t80", "review-old", ["codex", "exec", "Review the old way please, thoroughly"], ws + "/old", told, told + 42),
         "t90": {**record("t90", "review-kimi", ["kimi", "-p", "One more: check the docs as well."], kws, now - 30, now), "state": "live", "finished_ms": None, "exit_code": None, "reason": None},
     }
+    going = {"state": "live", "finished_ms": None, "exit_code": None, "reason": None}
+    records["vm/t91"] = {**record("vm/t91", "review-live", [WRAPPER, "codex", lws, brief, report], lws, tl, now, labels={"herdr.request": files + "/live-req.md"}), **going}
+    records["t92"] = {**record("t92", "review-kimi-live", [WRAPPER, "kimi", klws, brief, report], klws, tk, now), **going}
     screens = {a: {"text": "output of %s\nline 2\n\n\n" % a, "complete": a != "t80", "how": "history"} for a in records}
-    return {"codex": codex, "kimi": kimi, "records": records, "screens": screens, "t0": t0, "told": told, "ws": ws, "cws": cws, "kws": kws, "link": link, "files": files}
+    return {"codex": codex, "kimi": kimi, "records": records, "screens": screens, "t0": t0, "told": told, "tl": tl, "tk": tk, "ws": ws, "cws": cws, "kws": kws,
+            "link": link, "files": files, "live_file": live_file, "stages": stages}

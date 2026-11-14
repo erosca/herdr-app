@@ -44,18 +44,37 @@ function told(c, rounds) {
   });
 }
 
+// A run still going is looked at `c.looks` times, each look reading on from the last
+// (check.py lets its log grow in between): every look's rounds, the last one last.
+function looks(k, c, needs, asked) {
+  const all = [];
+  let state = null;
+  for (let n = 0; n < (c.looks ?? 1); n++) {
+    const got = replay(thread.liveSteps(k, state), needs, asked);
+    state = got.state;
+    all.push(got.rounds);
+  }
+  return all;
+}
+
 function run(c, needs) {
   if (c.call) return { name: c.name, result: thread[c.call](...c.args) };
   const asked = [];
   try {
+    const live = (c.live ?? []).map((k) => looks(k, c, needs, asked));
     const lists = [
       ...(c.runs ?? []).map((k) => replay(thread.roundsSteps(k), needs, asked)),
-      ...(c.live ?? []).map((k) => replay(thread.liveSteps(k), needs, asked)),
+      ...live.map((all) => all[all.length - 1]),
     ];
     const rounds = thread.inOrder(lists);
     // What was asked of the app, without the scripts: which kind, of which machine.
     const where = asked.map((q) => (q[0] === "hc" ? `hc ${q[1][0]} ${q[1][1]}` : q[0] === "sh" ? `sh ${q[3] ?? "here"} ${q[2][0]}` : `file ${q[2] ?? "here"} ${q[1]}`));
-    return { name: c.name, rounds, report: { name: c.name, asked: where, rounds: told(c, rounds) } };
+    // Each look at the first running one: what its last round had by then.
+    const seen = (live[0] ?? []).map((rs) => {
+      const r = rs[rs.length - 1];
+      return { steps: r.work.map((s) => `${s.kind} ${c.brief ? "" : s.text}`.trim()), answer: c.brief ? brief(r.answer) : r.answer, done: r.done ?? null, live: r.live };
+    });
+    return { name: c.name, rounds, report: { name: c.name, asked: where, rounds: told(c, rounds), looks: seen } };
   } catch (e) {
     if (e === NEED) return { name: c.name, pending: true };
     return { name: c.name, report: { name: c.name, error: String(e?.stack ?? e) } };
@@ -72,12 +91,12 @@ export default class Driver extends View {
     initConversation(this, cx, { thread: c.thread, runs: c.runs ?? [], live: c.live ?? [], rounds, overlay: "check" });
     if (OPEN == null) return;
     // One round open with everything in it unfolded: its whole request, its steps, its terminal output.
-    this.openRound = OPEN;
-    rounds.forEach((r, i) => {
-      this.full.add(i);
-      this.work.add(i);
-      if (r.transcript) this.term.add(i);
-    });
+    this.open = rounds[OPEN].key;
+    for (const r of rounds) {
+      this.full.add(r.key);
+      this.work.add(r.key);
+      if (r.transcript) this.term.add(r.key);
+    }
   }
 
   render() {

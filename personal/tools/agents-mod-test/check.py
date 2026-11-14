@@ -2,10 +2,12 @@
 """Checks the agents mod's conversation window in Herdr's own engine.
 
     personal/tools/agents-mod-test/check.py                  the fixture cases (below)
-    personal/tools/agents-mod-test/check.py --real t1g t1h   what the window makes of real finished runs
+    personal/tools/agents-mod-test/check.py --real t1g t1h   what the window makes of real runs, finished or still going
         --as vm       as Herdr sees them from another computer: addressed vm/t1g, their
                       logs read through `hc exec` (which is how a mod reaches a machine)
         --together    as one conversation (a first run and its follow-ups)
+        --looks 3     a run still going is looked at that many times, each look reading
+                      its log on from the last, as the open window does every few seconds
 
 Needs python3 and herdr-app (any build: the mod's files come from this checkout), and
 for --real or --as a running herdr-core. No node.
@@ -91,6 +93,11 @@ def host(request, world):
     script, args, on = request[1], request[2], request[3]
     if world.get("unreachable") and world["unreachable"] in args:
         return {"error": "machine %s is unreachable" % on}
+    # A log still being written: before each look that reads it on, it has grown.
+    if world.get("live_file") in args and world.get("stages") and args[-1] not in world.setdefault("read_on", set()):
+        world["read_on"].add(args[-1])
+        with open(world["live_file"], "a") as f:
+            f.write(world["stages"].pop(0))
     argv = ["sh", "-c", script, "sh"] + args
     env = world.get("env", {})
     if on and world.get("hc_exec"):
@@ -164,6 +171,8 @@ def fixture_cases(fx):
         {"name": "a codex from before 0.167", "runs": [whole("t80")], "thread": thread("review-old", CODEX, ["t80"])},
         {"name": "a kimi conversation with a round still running", "runs": [whole("t40", KIMI), whole("t41", KIMI)], "live": [short("t90", KIMI)],
          "thread": thread("review-kimi", KIMI, ["t40", "t41", "t90"])},
+        {"name": "a codex run still going, looked at three times", "live": [short("vm/t91")], "looks": 3, "thread": thread("review-live", CODEX, ["vm/t91"])},
+        {"name": "a kimi run still going", "live": [short("t92", KIMI)], "thread": thread("review-kimi-live", KIMI, ["t92"])},
         {"name": "agentOf", "call": "agentOf", "args": [{"argv": [wrapper, "codex", "/w", "/b.md", "/r.md"]}]},
         {"name": "agentOf: a script", "call": "agentOf", "args": [{"argv": ["sh", "-c", "cd w && ~/.kimi-code/bin/kimi -p hi"]}]},
         {"name": "agentOf: what Herdr saw running", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": CODEX}]},
@@ -257,7 +266,7 @@ def expect(fx, reports, answers):
           len([a for a in asked("a kimi follow-up that names its session") if a.startswith("sh")]) == 1, "kimi -S <session>: read at once, only that turn", r)
 
     (r,) = rounds("a codex run whose log isn't there") or [{}]
-    check(r.get("note") == "Codex's own log of this run wasn't found on vm: 2 Codex sessions were active then, none in this run's folder."
+    check(r.get("note") == "Codex's own log of this run wasn't found on vm: 3 Codex sessions were active then, none in this run's folder."
           and r.get("request") is None and r.get("answer") is None and r.get("transcript") == "output of vm/t50\nline 2",
           "no session in the run's folder: its terminal text, and a line saying where it looked and what it found", r.get("note"))
     name = "a program with request and answer labels"
@@ -282,6 +291,38 @@ def expect(fx, reports, answers):
     check(len(rs) == 3 and [x.get("live") for x in rs] == [False, False, True] and rs[-1].get("request") == "One more: check the docs as well.",
           "a follow-up still running is the last round, with its request", [x.get("live") for x in rs])
 
+    check(rs[-1].get("note") == "Kimi's own log of this run wasn't found: 1 Kimi session was active then, none in this run's folder." and rs[-1].get("work") == [],
+          "a run still going whose log isn't found says so, and still shows its request", rs[-1].get("note"))
+
+    name = "a codex run still going, looked at three times"
+    one, two, three = (by[name].get("looks") or []) + [{}] * (3 - len(by[name].get("looks") or []))
+    said, read, ran, edit = "say Starting with the **parser**.", "read src/parse.rs", "run cargo check", "edit src/parse.rs"
+    check((one.get("steps"), one.get("answer"), one.get("done"), one.get("live")) == ([said, read], None, False, True),
+          "a codex run still going: what its log has so far, and no answer yet", one)
+    check((two.get("steps"), two.get("answer"), two.get("done")) == ([said, read, ran], None, False),
+          "the next look adds what was written since; a line only half written waits for its other half", two)
+    check((three.get("steps"), three.get("answer"), three.get("done"), three.get("live")) == ([said, read, ran, edit], "Parser is fine.", True, True),
+          "the look after its turn ended has the half line whole, and its answer", three)
+    check(asked(name) == ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]] + ["sh vm %s" % a for a in
+                          (str(fx["tl"] - 120), fixtures.LIVE, fixtures.LIVE, fixtures.LIVE)],
+          "the session is looked for once; after that each look is one read of the log, and the run's record isn't asked for again", asked(name))
+    on = [v["value"]["stdout"] for _, v in sorted(((int(json.loads(k)[2][-1]), v) for k, v in answers.items() if fx["live_file"] in k and "value" in v), key=lambda x: x[0])]
+    check(len(on) == 2 and all("cat src/parse.rs" not in o for o in on) and "cargo check" in on[0] and "cargo check" not in on[1] and "FileChange" in on[1] and "FileChange" not in on[0],
+          "a look that reads on gets only what is new: %s bytes" % " and ".join(str(len(o)) for o in on))
+    (r,) = rounds(name) or [{}]
+    check((r.get("request"), r.get("session"), r.get("steps"), r.get("tokens"), r.get("transcript")) == (fixtures.LREQUEST, fixtures.LIVE, 3, 1660, None),
+          "its request from its label, its session, its steps and tokens; no terminal text is fetched for a run still going",
+          [r.get("request"), r.get("session"), r.get("steps"), r.get("tokens")])
+
+    name = "a kimi run still going"
+    (r,) = rounds(name) or [{}]
+    kinds = [s["kind"] for s in r.get("work", [])]
+    check(kinds == ["think", "say"] + ["read"] * 14 + ["say"] and r.get("work", [{}])[-1].get("text") == "Half an ans" and r.get("answer") is None and r.get("live") is True
+          and (r.get("request"), r.get("session"), r.get("steps"), r.get("tokens"), r.get("end")) == ("Look at the docs.", fixtures.KLIVE, 14, 1000, None),
+          "a kimi run still going: its steps so far, what it is saying as a step, not as its answer", [kinds, r.get("answer"), r.get("steps"), r.get("tokens")])
+    check(r.get("work", [{}, {}])[1].get("detail") is None and r.get("work", [{}, {}])[1].get("text") == "Looking at the docs, *all* of them.",
+          "what it said is kept whole, for the window to show as Markdown")
+
     result = lambda name: by[name].get("result")
     check([result(n) for n in ("agentOf", "agentOf: a script", "agentOf: what Herdr saw running", "agentOf: not an agent")] == ["codex", "kimi", "codex", None],
           "whose log to look for: a wrapper's first argument, a script's words, what Herdr saw running; not any argument")
@@ -291,7 +332,7 @@ def expect(fx, reports, answers):
           "runs group by parent and name, joined by a shared session; unnamed ones stand alone")
 
 
-def real_cases(addresses, machine, together):
+def real_cases(addresses, machine, together, looks=1):
     rows = {t["address"]: t for t in json.loads(subprocess.run(["hc", "ls", "--all", "--json"], capture_output=True, text=True).stdout)["terminals"]}
     at = lambda a: "%s/%s" % (machine, a) if machine else a
     runs = []
@@ -301,7 +342,7 @@ def real_cases(addresses, machine, together):
         t = rows[a]
         runs.append({"address": at(a), "name": t.get("name"), "parent": at(t["parent"]) if t.get("parent") else None, "state": t["state"], "program": None})
     groups = [runs] if together else [[r] for r in runs]
-    return [{"name": " + ".join(local(r["address"]) for r in g), "brief": True, ("live" if g[0]["state"] == "live" else "runs"): g,
+    return [{"name": " + ".join(local(r["address"]) for r in g), "brief": True, "looks": looks, ("live" if g[0]["state"] == "live" else "runs"): g,
              "thread": {"name": g[0]["name"] or g[0]["address"], "program": None, "asker": "Parent", "parent": g[0]["parent"], "names": [], "sessions": [], "addresses": [r["address"] for r in g]}}
             for g in groups]
 
@@ -311,13 +352,14 @@ def main():
     p.add_argument("--real", nargs="+", metavar="ADDRESS")
     p.add_argument("--as", dest="machine", metavar="MACHINE")
     p.add_argument("--together", action="store_true")
+    p.add_argument("--looks", type=int, default=1, metavar="N")
     a = p.parse_args()
     if not shutil.which("herdr-app"):
         sys.exit("herdr-app isn't on PATH")
     with tempfile.TemporaryDirectory(prefix="agents-mod-check-") as tmp:
         folder = os.path.join(tmp, "agents-check")
         if a.real:
-            cases = real_cases(a.real, a.machine, a.together)
+            cases = real_cases(a.real, a.machine, a.together, a.looks)
             world = {"hc_exec": bool(a.machine)}
             reports, answers = settle(folder, cases, world)
             print(json.dumps(reports, indent=1))
@@ -329,7 +371,7 @@ def main():
             # Runs addressed vm/... go through `hc exec` when a core is there to ask, as in the app.
             core = subprocess.run(["hc", "exec", "--json", "--", "true"], capture_output=True).returncode == 0 if shutil.which("hc") else False
             world = {"records": fx["records"], "screens": fx["screens"], "env": {"CODEX_HOME": fx["codex"], "KIMI_CODE_HOME": fx["kimi"]},
-                     "hc_exec": core, "unreachable": fx["ws"]}
+                     "hc_exec": core, "unreachable": fx["ws"], "live_file": fx["live_file"], "stages": list(fx["stages"])}
             reports, answers = settle(folder, cases, world)
             expect(fx, reports, answers)
             print("     (scripts for vm/... ran %s)" % ("through hc exec" if core else "directly: no herdr-core to go through"))
