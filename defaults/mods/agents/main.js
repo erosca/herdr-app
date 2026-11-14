@@ -1,11 +1,15 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
 // A viewed done agent stays in Done until left. Sub-agents that finished stay under
 // their agent in one folded "n finished" row while the core keeps them (a day after
-// their parent saw the result); clicking one shows its last output, dismissing hides it.
+// their parent saw the result), a follow-up under the same name with its first run;
+// clicking one opens its conversation (conversation.js), dismissing hides it.
 
-import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc, settings } from "herdr";
+import { View, div, svg } from "gpui-kit";
+import { v_flex, h_flex } from "gpui-base";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc } from "herdr";
+import { icon, ending, clock, about } from "./util.js";
+import { initConversation, conversationView } from "./conversation.js";
+import { groupThreads, threadOf, belongs } from "./thread.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -64,43 +68,8 @@ function duration(ms) {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
-// The agent's icon from the app's program table: a one-color glyph or a picture.
-function icon(p, size, color) {
-  if (!p?.icon) return null;
-  return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
-}
-
 // Finished sub-agents are shown unless switched off in the sort menu.
 const showFinished = () => shared("agents.finished") !== false;
-
-// How a finished sub-agent ended, when that's worth a word: a clean exit says nothing.
-function ending(k) {
-  if (k.reason === "killed") return { text: "stopped", bad: false };
-  if (k.exit_code != null && k.exit_code !== 0) return { text: `exit ${k.exit_code}`, bad: true };
-  if (k.signal != null) return { text: `signal ${k.signal}`, bad: true };
-  if (k.exit_code == null && k.reason && k.reason !== "exited") return { text: "lost", bad: true };
-  return null;
-}
-
-function span(ms) {
-  const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
-  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
-}
-
-function clock(ms) {
-  const d = new Date(ms);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-
-// The tooltip of a finished sub-agent: how it ended, how long it ran, when.
-function about(k) {
-  const how = ending(k)?.text ?? (k.exit_code === 0 ? "exit 0" : k.reason || "finished");
-  const ran = k.finished_ms != null && k.created_ms != null ? ` · ran ${span(k.finished_ms - k.created_ms)}` : "";
-  return `${how}${ran}${k.finished_ms != null ? ` · ended ${clock(k.finished_ms)}` : ""}`;
-}
 
 // The tree lines in front of a sub-row: one 13 px column per level.
 function connectors(t, lines) {
@@ -111,7 +80,7 @@ function connectors(t, lines) {
 
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.output) return this.loadOutput(cx);
+    if (props()?.thread) return initConversation(this, cx);
     if (props()?.sortMenu) return;
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
@@ -202,13 +171,16 @@ export default class Agents extends View {
     this.kidAt = kidAt;
   }
 
-  // Finished sub-agents of a listed agent and of its live sub-agents, newest first.
-  doneOf(addr, subs) {
+  // Finished sub-agents of a listed agent and of its live sub-agents, as conversations:
+  // a follow-up under the same name joins its first run. Newest end first; one with any
+  // run not dismissed shows whole.
+  threadsOf(addr, subs) {
     if (!showFinished()) return [];
     const owners = new Set([addr, ...subs.map((s) => s.t.address)]);
-    return this.done
-      .filter((k) => owners.has(k.parent) && !this.dismissed.has(k.address))
-      .sort((x, y) => (y.finished_ms ?? 0) - (x.finished_ms ?? 0));
+    const end = (th) => th.runs[th.runs.length - 1].finished_ms ?? 0;
+    return groupThreads(this.done.filter((k) => owners.has(k.parent)))
+      .filter((th) => th.runs.some((k) => !this.dismissed.has(k.address)))
+      .sort((x, y) => end(y) - end(x));
   }
 
   dismiss(addrs) {
@@ -245,10 +217,11 @@ export default class Agents extends View {
       .child(svg("mods/workspace-chrome/x.svg").size(12));
   }
 
-  // The folded row under an agent: how many of its sub-agents finished, and how many failed.
-  doneHeader(t, a, done, open) {
+  // The folded row under an agent: how many of its sub-agents finished, and how many
+  // failed (the last round decides).
+  doneHeader(t, a, threads, open) {
     const id = `done-${a.address}`;
-    const failed = done.filter((k) => ending(k)?.bad).length;
+    const failed = threads.filter((th) => ending(th.runs[th.runs.length - 1])?.bad).length;
     return this.hoverable(h_flex().id(id), id)
       .pl(39)
       .pr(8)
@@ -266,9 +239,10 @@ export default class Agents extends View {
       .children(connectors(t, ["└"]))
       .child(h_flex().w(14).mr(8).flex_none().justify_center()
         .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim)))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${done.length} finished`))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${threads.length} finished`))
       .when(failed > 0, (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(t.blocked).child(`${failed} failed`)))
-      .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`, "Clear finished", done.map((k) => k.address))));
+      .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`, "Clear finished",
+        threads.flatMap((th) => th.runs.map((k) => k.address)))));
   }
 
   nameOf(k) {
@@ -276,15 +250,38 @@ export default class Agents extends View {
     return k.name || k.template || known?.n || (k.program ?? known?.p)?.name || k.address;
   }
 
-  // One finished sub-agent: dimmed, how it ended if not cleanly, and since when.
-  // Names are unique only among running terminals: a name used again gets its end time.
-  doneRow(t, k, lines, now, repeated = false) {
+  progOf(k) {
+    return k.program ?? this.progs[k.address]?.p ?? null;
+  }
+
+  // What the conversation window gets: plain records, each with its program.
+  slim(k) {
+    const { address, name, template, argv, cwd, labels, parent, created_ms, finished_ms, exit_code, signal, reason } = k;
+    return { address, name, template, argv, cwd, labels, parent, created_ms, finished_ms, exit_code, signal, reason, program: this.progOf(k) };
+  }
+
+  // Opens a conversation as big as a running sub-agent's peek.
+  openThread(th, asker) {
+    const last = th.runs[th.runs.length - 1];
+    const thread = threadOf(th.runs);
+    const live = terminals().filter((k) => k.state === "live" && belongs(thread, k));
+    openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
+      thread: { ...thread, name: this.nameOf(last), program: this.progOf(last), asker },
+      runs: th.runs.map((k) => this.slim(k)),
+      live: live.map((k) => this.slim(k)),
+    } });
+  }
+
+  // One finished conversation: dimmed, how its last round ended if not cleanly, and
+  // since when; more than one round says how many. Names are unique only among running
+  // terminals: a name two conversations share gets their end times.
+  doneRow(t, th, lines, now, asker, repeated = false) {
+    const k = th.runs[th.runs.length - 1];
     const id = `fin-${k.address}`;
-    const known = this.progs[k.address];
-    const prog = k.program ?? known?.p;
-    const pic = icon(prog, 14, t.dim);
+    const pic = icon(this.progOf(k), 14, t.dim);
     const end = ending(k);
     const name = this.nameOf(k);
+    const n = th.runs.length;
     return this.hoverable(h_flex().id(id), id)
       .pl(39)
       .pr(8)
@@ -295,78 +292,17 @@ export default class Agents extends View {
       .text_size(12.5)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
-      .tooltip(about(k))
-      // As big as a running sub-agent's peek.
-      .on_click(() => openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: { output: k.address, name, about: about(k) } }))
+      .tooltip(n > 1 ? `${n} rounds · last ${about(k)}` : about(k))
+      .on_click(() => this.openThread(th, asker))
       .children(connectors(t, lines))
       .child(div().w(14).mr(8).flex_none().opacity(0.55).when(Boolean(pic), (el) => el.child(pic)))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(repeated && k.finished_ms != null ? `${name} · ${clock(k.finished_ms)}` : name))
+      .child(div().min_w(0).truncate().text_color(t.dim).child(repeated && k.finished_ms != null ? `${name} · ${clock(k.finished_ms)}` : name))
+      .when(n > 1, (el) => el.child(div().flex_none().ml(5).px(4).rounded(4).bg(t.hover).text_size(10).text_color(t.dim).child(String(n))))
+      .child(div().flex_1())
       .when(Boolean(end), (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(end.bad ? t.blocked : t.dim).child(end.text)))
       .child(this.hovered === id
-        ? this.dismissButton(t, `x-${k.address}`, "Dismiss", [k.address])
+        ? this.dismissButton(t, `x-${k.address}`, "Dismiss", th.runs.map((r) => r.address))
         : div().flex_none().ml(6).text_size(11).text_color(t.dim).child(k.finished_ms != null ? duration(now - k.finished_ms) : ""));
-  }
-
-  // The output dialog: what a finished sub-agent printed last, read-only.
-  loadOutput(cx) {
-    cx.spawn(async (cx) => {
-      try {
-        const r = await hc(["read", props().output, "--lines", "1000", "--json"]);
-        let text = r.stdout;
-        try {
-          const read = JSON.parse(r.stdout);
-          text = read.text ?? "";
-          this.cut = read.complete === false;
-        } catch (_) {}
-        text = text.replace(/\s+$/, "");
-        if (r.code !== 0) this.outputError = "Herdr-core no longer has this output.";
-        else if (!text) this.outputError = "It printed nothing.";
-        else this.code = EditorState.new({ language: "text", value: text, readonly: true, line_numbers: false, folding: false,
-          font_family: settings().font_family, font_size: 12 });
-      } catch (_) {
-        this.outputError = "Couldn't read its output.";
-      } finally {
-        cx.notify();
-      }
-    });
-  }
-
-  outputView(t) {
-    const p = props();
-    return v_flex()
-      .size_full()
-      .bg(t.surface)
-      .child(h_flex()
-        .h(38)
-        .px(14)
-        .gap(8)
-        .flex_none()
-        .items_center()
-        .border_b(1)
-        .border_color(t.border)
-        .child(div().min_w(0).truncate().text_size(13).font_medium().text_color(t.foreground).child(p.name))
-        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(p.about ?? ""))
-        .child(div()
-          .id("output-close")
-          .p(3)
-          .rounded(4)
-          .text_color(t.dim)
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .on_click(() => closeOverlay(p.overlay))
-          .child(svg("mods/workspace-chrome/x.svg").size(13))))
-      .when(Boolean(this.cut && this.code), (el) => el.child(div()
-        .px(14)
-        .py(5)
-        .flex_none()
-        .border_b(1)
-        .border_color(t.border)
-        .text_size(11.5)
-        .text_color(t.dim)
-        .child("Earlier output isn't kept: herdr-core keeps the last 1,000 lines of a finished sub-agent.")))
-      .child(this.code
-        ? Editor.new(this.code).flex_1().min_h(0)
-        : div().p(14).text_size(12).text_color(t.dim).child(this.outputError ?? "Loading…"));
   }
 
   // Stamps agents whose state changed. Done and idle count as one: looking at a
@@ -520,7 +456,7 @@ export default class Agents extends View {
 
   render(cx) {
     const t = theme();
-    if (props()?.output) return this.outputView(t);
+    if (props()?.thread) return conversationView(this, t);
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
     const sort = sortOf();
@@ -546,7 +482,7 @@ export default class Agents extends View {
     const withKids = (a, i) => {
       let subs = collapsed ? [] : this.tree(all, a.address);
       // Finished ones go last, in one folded row; the live tree's line runs on to it.
-      const done = collapsed ? [] : this.doneOf(a.address, subs);
+      const done = collapsed ? [] : this.threadsOf(a.address, subs);
       if (done.length) subs = this.tree(all, a.address, [], true);
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
@@ -554,9 +490,12 @@ export default class Agents extends View {
       if (done.length) {
         const open = this.openDone.has(a.address);
         rows.push(this.doneHeader(t, a, done, open));
-        const names = done.map((k) => this.nameOf(k));
-        const repeated = (k, j) => names.indexOf(names[j]) !== names.lastIndexOf(names[j]);
-        if (open) rows.push(...done.map((k, j) => this.doneRow(t, k, ["", j === done.length - 1 ? "└" : "├"], now, repeated(k, j))));
+        // Who asked, as the conversation's request blocks say it: the agent, or a sub-agent.
+        const askers = new Map([[a.address, a.program?.name || "Parent"], ...subs.map((s) => [s.t.address, this.nameOf(s.t)])]);
+        const names = done.map((th) => this.nameOf(th.runs[th.runs.length - 1]));
+        const repeated = (j) => names.indexOf(names[j]) !== names.lastIndexOf(names[j]);
+        if (open) rows.push(...done.map((th, j) => this.doneRow(t, th, ["", j === done.length - 1 ? "└" : "├"], now,
+          askers.get(th.runs[0].parent) ?? "Parent", repeated(j))));
       }
       return rows;
     };

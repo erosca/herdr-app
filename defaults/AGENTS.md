@@ -157,8 +157,17 @@ the highlighted line shows where it will land.
   `terminal.peek` opens one, `terminal.keep` gives one a pane.
   `terminals()` lists live terminals only; the `agents` mod gets finished
   sub-agents from `hc ls --all --json` and shows them in one folded "n finished"
-  row under their agent while the core keeps them (clicking one shows its last
-  output, hovering offers dismiss; shared `"agents.finished": false` hides them).
+  row under their agent while the core keeps them; hovering offers dismiss, shared
+  `"agents.finished": false` hides them. Clicking one opens its conversation:
+  each round's request, its work (folded) and its answer as Markdown. A follow-up
+  under the same `--name` and parent, or with the same `herdr.session` label, is
+  the next round of the same conversation. Each round comes from the run's labels
+  `herdr.request=<file>`, `herdr.answer=<file>` (absolute paths) and
+  `herdr.session=<codex session id>`, else from codex's own session log, else
+  from the command line and the last 1000 lines of output. Asking a reviewer:
+  `hc run --name reviewer --label herdr.request=$PWD/.review/req-1.md --label herdr.answer=$PWD/.review/ans-1.md -- codex exec -o $PWD/.review/ans-1.md "$(cat .review/req-1.md)"`;
+  a follow-up runs `codex exec resume <session id> -o <answer file> "<question>"`
+  under the same name, with new files and `--label herdr.session=<session id>`.
   Ctrl-click (Cmd-click on macOS) a live terminal address in terminal text to
   peek at it. Bare addresses refer to the machine of the terminal showing them;
   use `machine/address` for another machine. Names and non-live addresses aren't links.
