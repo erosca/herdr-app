@@ -92,6 +92,20 @@ glyph shapes can still differ by a shade per pixel: Tilix draws them with
 FreeType, Herdr with its own rasterizer. To compare unhinted glyphs, start
 Herdr with `HERDR_FONT_HINTING=0`.
 
+## Checking the agents list's conversation window
+
+`personal/tools/agents-mod-test/check.py` runs the `agents` mod's conversation
+window (what a finished sub-agent opens as) in Herdr's own engine, with
+`herdr-app check`: on made-up codex and Kimi Code logs in their real formats, or
+with `--real <address>...` on finished runs of this machine's herdr-core. It needs
+`python3` and `herdr-app`, nothing else. Run it after changing
+`defaults/mods/agents/thread.js` or `conversation.js`:
+
+```sh
+personal/tools/agents-mod-test/check.py                       # the fixture cases
+personal/tools/agents-mod-test/check.py --real t1g t1h --as vm   # real runs, as seen from another computer
+```
+
 ## Dummy agent
 
 `dummy-agent` is the smallest agent, to try Herdr's agent features with: every

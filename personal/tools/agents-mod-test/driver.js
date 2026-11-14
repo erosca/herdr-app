@@ -1,0 +1,88 @@
+// What check.py runs in place of the agents mod's main.js, through `herdr-app check`:
+// the mod's own thread.js and conversation.js in Herdr's engine. The engine runs one
+// init and one render, nothing asynchronous, and reports only a thrown error, so:
+//   - the mod's steps (thread.js) are replayed against the answers check.py recorded;
+//     a request with no answer yet stops the case and is thrown as NEED, for check.py
+//     to run and ask again;
+//   - MODE "report" throws what each case came to, for check.py to compare;
+//   - MODE "view" renders one case's conversation window for real: a wrong element
+//     method or argument fails the check.
+
+import { View } from "gpui-kit";
+import { theme } from "herdr";
+import * as thread from "./thread.js";
+import { initConversation, conversationView } from "./conversation.js";
+import { CASES, ANSWERS, MODE, VIEW, OPEN } from "./cases.js";
+
+const NEED = {};
+
+function replay(steps, needs, asked) {
+  let r = steps.next();
+  while (!r.done) {
+    asked.push(r.value);
+    const a = ANSWERS[JSON.stringify(r.value)];
+    if (!a) {
+      needs.push(r.value);
+      throw NEED;
+    }
+    r = "error" in a ? steps.throw(new Error(a.error)) : steps.next(a.value);
+  }
+  return r.value;
+}
+
+// A long text as its length: real conversations stay out of the report.
+const brief = (s) => (typeof s === "string" && s.length > 60 ? { chars: s.length } : s);
+
+function told(c, rounds) {
+  return rounds.map((r) => {
+    const { run, transcript, ...rest } = r;
+    const out = { ...rest, address: run?.address ?? null, transcript: c.brief ? brief(transcript) : transcript };
+    if (!c.brief) return out;
+    const kinds = {};
+    for (const s of r.work) kinds[s.kind] = (kinds[s.kind] ?? 0) + 1;
+    return { ...out, request: brief(r.request), answer: brief(r.answer), work: { kinds, failed: r.work.filter((s) => s.error).length, timed: r.work.filter((s) => s.ms != null).length } };
+  });
+}
+
+function run(c, needs) {
+  if (c.call) return { name: c.name, result: thread[c.call](...c.args) };
+  const asked = [];
+  try {
+    const lists = [
+      ...(c.runs ?? []).map((k) => replay(thread.roundsSteps(k), needs, asked)),
+      ...(c.live ?? []).map((k) => replay(thread.liveSteps(k), needs, asked)),
+    ];
+    const rounds = thread.inOrder(lists);
+    // What was asked of the app, without the scripts: which kind, of which machine.
+    const where = asked.map((q) => (q[0] === "hc" ? `hc ${q[1][0]} ${q[1][1]}` : q[0] === "sh" ? `sh ${q[3] ?? "here"} ${q[2][0]}` : `file ${q[2] ?? "here"} ${q[1]}`));
+    return { name: c.name, rounds, report: { name: c.name, asked: where, rounds: told(c, rounds) } };
+  } catch (e) {
+    if (e === NEED) return { name: c.name, pending: true };
+    return { name: c.name, report: { name: c.name, error: String(e?.stack ?? e) } };
+  }
+}
+
+export default class Driver extends View {
+  init(_props, cx) {
+    this.needs = [];
+    this.done = CASES.map((c) => run(c, this.needs));
+    if (MODE !== "view" || this.needs.length) return;
+    const c = CASES[VIEW];
+    const rounds = this.done[VIEW].rounds;
+    initConversation(this, cx, { thread: c.thread, runs: c.runs ?? [], live: c.live ?? [], rounds, overlay: "check" });
+    if (OPEN == null) return;
+    // One round open with everything in it unfolded: its whole request, its steps, its terminal output.
+    this.openRound = OPEN;
+    rounds.forEach((r, i) => {
+      this.full.add(i);
+      this.work.add(i);
+      if (r.transcript) this.term.add(i);
+    });
+  }
+
+  render() {
+    if (this.needs.length) throw new Error(`NEED ${JSON.stringify(this.needs)}`);
+    if (MODE === "report") throw new Error(`REPORT ${JSON.stringify(this.done.map((d) => d.report ?? { name: d.name, result: d.result }))}`);
+    return conversationView(this, theme());
+  }
+}
