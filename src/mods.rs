@@ -1038,6 +1038,10 @@ pub fn init(cx: &mut App) {
 pub fn apply_theme(cx: &mut App) {
     let t = crate::settings::theme();
     let g = |k: &str| t.get(k).cloned().unwrap_or_default();
+    // Mod text paints its selection over the glyphs, so it must let them through. The
+    // theme's `selection` is the terminals': solid, drawn under their text; over a
+    // mod's text it would hide what is selected. The accent, as a wash, doesn't.
+    let wash = |c: String| if c.len() == 7 { format!("{c}59") } else { c };
     let palette = json!({
         "background": g("background"), "foreground": g("foreground"),
         "surface": g("surface"), "surface_foreground": g("foreground"),
@@ -1047,7 +1051,7 @@ pub fn apply_theme(cx: &mut App) {
         "accent": g("hover"), "accent_foreground": g("foreground"),
         "destructive": g("blocked"), "destructive_foreground": g("background"),
         "border": g("border"), "input": g("input"), "ring": g("ring"),
-        "selection": g("selection"),
+        "selection": wash(g("accent")),
     });
     match serde_json::from_value::<gpui_base::ColorTokens>(palette) {
         Ok(colors) => {
