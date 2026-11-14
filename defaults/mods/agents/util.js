@@ -30,9 +30,18 @@ export function clock(ms) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-// The tooltip of a finished sub-agent: how it ended, how long it ran, when.
-export function about(k) {
-  const how = ending(k)?.text ?? (k.exit_code === 0 ? "exit 0" : k.reason || "finished");
-  const ran = k.finished_ms != null && k.created_ms != null ? ` · ran ${span(k.finished_ms - k.created_ms)}` : "";
-  return `${how}${ran}${k.finished_ms != null ? ` · ended ${clock(k.finished_ms)}` : ""}`;
-}
+// The windows a sub-agent opens as, as openOverlay takes them. Both are as big as a peek.
+const BIG = { kind: "dialog", width: 0.8, height: 0.8 };
+
+/** Its conversation: each round's request, work and answer. `find`: the conversation's
+ * finished runs are asked of the core first (the opener's list may lack the newest). */
+export const conversationOf = (thread, runs, live, find = false) => ({ mod: "agents", ...BIG, props: { thread, runs, live, find } });
+
+// How tall the bar over a watched terminal is: its header, and its request's first lines.
+export const WATCH_HEAD = 168;
+
+/** A running one's live terminal, under a bar with the request it was sent (watch.js). */
+export const watchOf = (thread, runs, k) => ({ ...BIG, layout: { type: "column", children: [
+  { type: "block", size: { px: WATCH_HEAD }, content: { mod: "agents", props: { watch: { thread, runs, live: k } } } },
+  { type: "block", content: { terminal: k.address } },
+] } });

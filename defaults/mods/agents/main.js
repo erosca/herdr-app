@@ -3,15 +3,17 @@
 // their agent in one folded "n finished" row while the core keeps them (a day after
 // their parent saw the result), a follow-up under the same name with its first run;
 // clicking one opens its conversation (conversation.js), dismissing hides it. A
-// sub-agent still working opens the same window, filled as it goes, when Herdr reads
-// its agent's log (codex, Kimi Code); any other, or one that needs the person, opens
-// as its terminal (peek).
+// sub-agent still working opens as its live terminal: under a bar with the request it
+// was sent when Herdr reads its agent's log (codex, Kimi Code; watch.js), which gives
+// way to its conversation when it ends; any other, or one that needs the person, as
+// the plain peek.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc } from "herdr";
-import { icon, ending, clock, about } from "./util.js";
+import { icon, ending, clock, conversationOf, watchOf } from "./util.js";
 import { initConversation, conversationView } from "./conversation.js";
+import { initWatch, watchView } from "./watch.js";
 import { groupThreads, threadOf, belongs, fullRecord, agentOf } from "./thread.js";
 
 function find(node, id) {
@@ -83,6 +85,7 @@ function connectors(t, lines) {
 
 export default class Agents extends View {
   init(_props, cx) {
+    if (props()?.watch) return initWatch(this, cx);
     if (props()?.thread || props()?.conversation) return initConversation(this, cx);
     if (props()?.sortMenu) return;
     this.folded = new Set();
@@ -212,7 +215,7 @@ export default class Agents extends View {
     });
   }
 
-  dismissButton(t, id, tip, addrs) {
+  dismissButton(t, id, addrs) {
     return div()
       .id(id)
       .flex_none()
@@ -222,7 +225,6 @@ export default class Agents extends View {
       .text_color(t.dim)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .tooltip(tip)
       .on_click((_e, cx) => {
         cx.stop_propagation();
         this.dismiss(addrs);
@@ -256,7 +258,7 @@ export default class Agents extends View {
         .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim)))
       .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${threads.length} finished`))
       .when(failed > 0, (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(t.blocked).child(`${failed} failed`)))
-      .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`, "Clear finished",
+      .when(this.hovered === id, (el) => el.child(this.dismissButton(t, `clear-${a.address}`,
         threads.flatMap((th) => th.runs.map((k) => k.address)))));
   }
 
@@ -280,11 +282,8 @@ export default class Agents extends View {
     const last = th.runs[th.runs.length - 1];
     const thread = threadOf(th.runs);
     const live = terminals().filter((k) => k.state === "live" && belongs(thread, k));
-    openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
-      thread: { ...thread, name: this.nameOf(last), program: this.progOf(last), asker },
-      runs: th.runs.map((k) => this.slim(k)),
-      live: live.map((k) => this.slim(k)),
-    } });
+    openOverlay(conversationOf({ ...thread, name: this.nameOf(last), program: this.progOf(last), asker },
+      th.runs.map((k) => this.slim(k)), live.map((k) => this.slim(k))));
   }
 
   // One finished conversation: dimmed, how its last round ended if not cleanly, and
@@ -307,7 +306,6 @@ export default class Agents extends View {
       .text_size(12.5)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
-      .tooltip(n > 1 ? `${n} rounds · last ${about(k)}` : about(k))
       .on_click(() => this.openThread(th, asker))
       .children(connectors(t, lines))
       .child(div().w(14).mr(8).flex_none().opacity(0.55).when(Boolean(pic), (el) => el.child(pic)))
@@ -316,7 +314,7 @@ export default class Agents extends View {
       .child(div().flex_1())
       .when(Boolean(end), (el) => el.child(div().flex_none().ml(6).text_size(11).text_color(end.bad ? t.blocked : t.dim).child(end.text)))
       .child(this.hovered === id
-        ? this.dismissButton(t, `x-${k.address}`, "Dismiss", th.runs.map((r) => r.address))
+        ? this.dismissButton(t, `x-${k.address}`, th.runs.map((r) => r.address))
         : div().flex_none().ml(6).text_size(11).text_color(t.dim).child(k.finished_ms != null ? duration(now - k.finished_ms) : ""));
   }
 
@@ -417,18 +415,16 @@ export default class Agents extends View {
     run("terminal.peek", { terminal: addr });
   }
 
-  // A running sub-agent: its conversation so far, read from its agent's own log, with
-  // the rounds it finished before. Its terminal instead when there is no such log to
-  // read, or when it waits for the person: that is where they answer it.
+  // A running sub-agent: its live terminal, what it prints as it prints it. One whose
+  // agent's log Herdr reads gets it under a bar with the request it was sent, and the
+  // rounds it finished before go along for when it ends. One that waits for the person
+  // opens as the plain peek, the keyboard in its terminal: that is where they answer.
   look(k, status, asker) {
     if (status === "blocked" || !agentOf(k)) return this.peek(k.address);
     const mine = threadOf([k]);
     const earlier = this.done.filter((d) => belongs(mine, d)).sort((x, y) => (x.created_ms ?? 0) - (y.created_ms ?? 0));
-    openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
-      thread: { ...threadOf([...earlier, k]), name: this.nameOf(k), program: this.progOf(k), asker },
-      runs: earlier.map((d) => this.slim(d)),
-      live: [this.slim(k)],
-    } });
+    openOverlay(watchOf({ ...threadOf([...earlier, k]), name: this.nameOf(k), program: this.progOf(k), asker },
+      earlier.map((d) => this.slim(d)), this.slim(k)));
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
@@ -485,6 +481,7 @@ export default class Agents extends View {
 
   render(cx) {
     const t = theme();
+    if (props()?.watch) return watchView(this, t);
     if (props()?.thread || props()?.conversation) return conversationView(this, t);
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();

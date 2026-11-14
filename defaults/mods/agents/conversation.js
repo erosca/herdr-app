@@ -6,18 +6,19 @@
 //   - still working: the same steps as they happen, read again every few seconds from
 //     the agent's log, the latest ones shown. The window only reads: nothing typed here
 //     reaches the agent. Its live terminal is one click away (Terminal, in the header).
+// A step cut to one line unfolds in place when clicked. Nothing here pops up on hover.
 // Older rounds start folded, the newest open; Up and Down move between rounds, Esc closes.
 // Props: { thread: { name, program, asker, parent, names, sessions, addresses },
-//          runs: [finished run records], live: [running ones], overlay },
+//          runs: [finished run records], live: [running ones], find?, overlay },
 //     or { conversation: <a running sub-agent's address>, overlay }.
 // While open it follows the conversation: a follow-up that starts or ends shows up.
 // A round's `note` says what couldn't be found or read, under its request.
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { props, run, closeOverlay, settings, terminals, hc } from "herdr";
+import { props, closeOverlay, openOverlay, settings, terminals, hc } from "herdr";
 import { finishedRounds, liveRounds, inOrder, belongs, fullRecord, threadOf } from "./thread.js";
-import { icon, ending, span, clock } from "./util.js";
+import { icon, ending, span, clock, watchOf } from "./util.js";
 
 const SHOWN_LINES = 8;
 const MAX_STEPS = 400;
@@ -59,6 +60,8 @@ export function initConversation(v, cx, given = props()) {
   v.full = new Set();
   v.work = new Set();
   v.term = new Set();
+  // Steps unfolded to their whole text, by round and place.
+  v.steps = new Set();
   v.editors = new Map();
   v.size = null;
   v.keys = cx.focus_handle();
@@ -66,9 +69,10 @@ export function initConversation(v, cx, given = props()) {
   v.seen = liveKey(v.live);
   v.at = 0;
   if (p.rounds) return show(v, p.rounds);
-  // With a run still going, or opened by address alone, the conversation's finished
-  // runs are asked of the core first: the list the window was opened from may lack them.
-  if (v.live.length || !asked.thread) refresh(v, cx, v.live);
+  // With a run still going, opened by address alone or told to (`find`), the
+  // conversation's finished runs are asked of the core first: the list the window was
+  // opened from may lack them.
+  if (v.live.length || !asked.thread || asked.find) refresh(v, cx, v.live);
   else load(v, cx);
   cx.timer.every(1000, (cx) => {
     if (v.loading) return;
@@ -89,12 +93,19 @@ function load(v, cx) {
       // Records from the list lack their times and command line: the header needs them.
       v.runs = await Promise.all(v.runs.map(fullRecord));
       const todo = v.runs.filter((k) => !v.done.has(k.address));
-      const read = await Promise.all(todo.map(finishedRounds));
-      todo.forEach((k, i) => v.done.set(k.address, read[i]));
+      const reading = Promise.all(todo.map(finishedRounds));
       const live = v.live;
       const going = await Promise.all(live.map((k) => liveRounds(k, v.states.get(k.address) ?? null)));
       live.forEach((k, i) => v.states.set(k.address, going[i].state));
-      show(v, inOrder([...v.runs.map((k) => v.done.get(k.address) ?? []), ...going.map((g) => g.rounds)]));
+      const all = () => inOrder([...v.runs.map((k) => v.done.get(k.address) ?? []), ...going.map((g) => g.rounds)]);
+      // The round still going shows at once; the finished ones join it as they are read.
+      if (live.length && todo.length) {
+        show(v, all());
+        cx.notify();
+      }
+      const read = await reading;
+      todo.forEach((k, i) => v.done.set(k.address, read[i]));
+      show(v, all());
     } catch (_) {
       if (v.rounds === null) show(v, []);
     }
@@ -218,9 +229,8 @@ export function conversationView(v, t) {
         .flex_none()
         .text_size(11)
         .text_color(t.dim)
-        .tooltip(`Session ${session}`)
         .child(`session ${String(session).replace(/^session_/, "").slice(0, 8)}`)))
-      // This window only reads. The terminal is where it can be watched raw, or typed into.
+      // This window only reads. Its live terminal is what it prints as it prints it, and where to type into it.
       .when(Boolean(going), (el) => el.child(div()
         .id("conversation-terminal")
         .flex_none()
@@ -231,10 +241,9 @@ export function conversationView(v, t) {
         .text_color(t.accent)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
-        .tooltip("Its live terminal: its raw output, and where to type into it")
         .on_click(() => {
           closeOverlay(p.overlay);
-          run("terminal.peek", { terminal: going.address });
+          openOverlay(watchOf(th, runs, going));
         })
         .child("Terminal")))
       .child(div()
@@ -365,17 +374,26 @@ function offset(ms) {
 }
 
 // One step: when, what kind (an icon; a dot for what it set out to do), and what. What
-// it said along the way reads as its answer will: as Markdown, in full.
-function stepRow(t, r, s, key) {
+// it said along the way reads as its answer will: as Markdown, in full. A step cut to
+// its first line (a long command, a thought) unfolds to the whole of it on a click.
+function stepRow(v, t, r, s, key) {
   const icon = ICONS[s.kind];
   const think = s.kind === "think";
   const say = s.kind === "say";
+  const more = !say && Boolean(s.detail);
+  const whole = more && v.steps.has(key);
+  const text = () => div().text_size(12)
+    .when(s.kind === "run" || (whole && !think), (el) => el.font_family(settings().font_family))
+    .text_color(think ? t.foreground : t.muted);
   return h_flex()
     .id(`step-${key}`)
     .gap(8)
     .min_h(20)
     .items_center()
-    .when(Boolean(s.detail) && !say, (el) => el.tooltip(s.detail))
+    .when(more, (el) => el.cursor_pointer().on_click((_e, cx) => {
+      whole ? v.steps.delete(key) : v.steps.add(key);
+      cx.notify();
+    }))
     .child(div().self_start().mt(3).w(40).flex_none().text_size(11).text_color(t.dim).child(s.at != null && r.at != null ? offset(s.at - r.at) : ""))
     .child(h_flex().self_start().mt(4).w(14).h(12).flex_none().items_center().justify_center()
       .child(icon
@@ -383,18 +401,17 @@ function stepRow(t, r, s, key) {
         : div().size(think ? 5 : 4).rounded(3).bg(think ? t.muted : t.dim)))
     .child(say
       ? div().flex_1().min_w(0).py(1).text_size(12.5).text_color(t.muted).child(TextView.markdown(`said-${key}`, s.detail ?? s.text).selectable(true))
-      : div().flex_1().min_w(0).truncate().text_size(12)
-        .when(s.kind === "run", (el) => el.font_family(settings().font_family))
-        .text_color(think ? t.foreground : t.muted)
-        .child(s.text))
+      : whole
+        ? v_flex().flex_1().min_w(0).py(1).children(s.detail.split("\n").map((l) => text().child(l || " ")))
+        : text().flex_1().min_w(0).truncate().child(s.text))
     // How long it took, when that's worth a word, and how it failed.
-    .when(s.ms >= 2000 && !s.error, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(span(s.ms))))
-    .when(Boolean(s.error), (el) => el.child(div().flex_none().text_size(11).text_color(t.blocked).child(s.error === true ? "failed" : s.error)));
+    .when(s.ms >= 2000 && !s.error, (el) => el.child(div().self_start().mt(3).flex_none().text_size(11).text_color(t.dim).child(span(s.ms))))
+    .when(Boolean(s.error), (el) => el.child(div().self_start().mt(3).flex_none().text_size(11).text_color(t.blocked).child(s.error === true ? "failed" : s.error)));
 }
 
 // Steps `from` on, each under the same name whatever else is shown: a row keeps its
 // place and its selection while newer ones arrive.
-const stepRows = (t, r, from) => r.work.slice(from).map((s, j) => stepRow(t, r, s, `${r.key}-${from + j}`));
+const stepRows = (v, t, r, from) => r.work.slice(from).map((s, j) => stepRow(v, t, r, s, `${r.key}-${from + j}`));
 
 // What it did, step by step, from its own log; its terminal output one click away.
 function stepsView(v, t, r, i) {
@@ -404,7 +421,7 @@ function stepsView(v, t, r, i) {
     .gap(2)
     .py(2)
     .when(hidden > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(`${hidden} earlier steps aren't shown`)))
-    .children(stepRows(t, r, hidden))
+    .children(stepRows(v, t, r, hidden))
     .when(Boolean(r.transcript), (el) => el.child(div()
       .id(`terminal-${r.key}`)
       .mt(6)
@@ -419,10 +436,10 @@ function stepsView(v, t, r, i) {
     .when(term && v.editors.has(r.key), (el) => el.child(transcriptView(v, t, r, i)));
 }
 
-const facts = (r, lead) => [lead, r.steps != null ? `${r.steps} ${r.steps === 1 ? "step" : "steps"}` : null,
-  r.tokens ? `${tokens(r.tokens)} tokens` : null].filter(Boolean).join(" · ");
-// Tokens: what the model read anew and wrote. What it re-read from its cache each time is far more, and says little.
-const tokensTip = (r) => (r.tokens && r.cached ? `${tokens(r.tokens)} tokens read anew and written, ${tokens(r.cached)} more re-read from cache` : null);
+// Tokens: what the model read anew and wrote. What it re-read from its cache each time
+// is far more and says little: named only where there is room, in an open fold's line.
+const facts = (r, lead, cache = false) => [lead, r.steps != null ? `${r.steps} ${r.steps === 1 ? "step" : "steps"}` : null,
+  r.tokens ? `${tokens(r.tokens)} tokens${cache && r.cached ? ` read anew and written, ${tokens(r.cached)} more re-read from cache` : ""}` : null].filter(Boolean).join(" · ");
 
 // A round still going: how long and how much so far, then its steps as a finished
 // round's fold shows them, the latest ones (all of them one click away). A log that
@@ -431,7 +448,6 @@ function workingViews(v, t, r) {
   const all = v.work.has(r.key);
   const n = r.work.length;
   const from = Math.max(0, n - (all ? MAX_STEPS : LATEST));
-  const tip = tokensTip(r);
   const quiet = r.seen != null ? Date.now() - r.seen : 0;
   const out = [h_flex()
     .id(`working-${r.key}`)
@@ -439,7 +455,6 @@ function workingViews(v, t, r) {
     .items_center()
     .text_size(11.5)
     .text_color(t.dim)
-    .when(Boolean(tip), (el) => el.tooltip(tip))
     .child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900))
     .child(facts(r, r.at != null ? `Working ${span(Date.now() - r.at)}` : "Working"))
     .when(quiet >= 60000, (el) => el.child(`· nothing new for ${span(quiet)}`))];
@@ -456,7 +471,7 @@ function workingViews(v, t, r) {
       .child(all ? `Show only the latest ${LATEST} steps` : `Show ${from} earlier steps`));
   }
   if (all && from > 0) out.push(div().text_size(11).text_color(t.dim).child(`${from} earlier steps aren't shown`));
-  if (n) out.push(v_flex().gap(2).children(stepRows(t, r, from)));
+  if (n) out.push(v_flex().gap(2).children(stepRows(v, t, r, from)));
   else if (!r.note) out.push(div().text_size(12).text_color(t.dim).child("Nothing in its log yet."));
   return out;
 }
@@ -470,7 +485,6 @@ function answerViews(v, t, r, i, took) {
     return [div().text_size(11).text_color(t.dim).child("Output (no separate answer was recorded)"), transcriptView(v, t, r, i, true)];
   }
   const out = [];
-  const tip = tokensTip(r);
   const shown = v.work.has(r.key);
   out.push(h_flex()
     .id(`work-${r.key}`)
@@ -478,7 +492,6 @@ function answerViews(v, t, r, i, took) {
     .items_center()
     .text_size(11.5)
     .text_color(t.dim)
-    .when(Boolean(tip), (el) => el.tooltip(tip))
     .when(steps || Boolean(r.transcript), (el) => el
       .cursor_pointer()
       .hover((s) => s.text_color(t.foreground))
@@ -487,7 +500,7 @@ function answerViews(v, t, r, i, took) {
         cx.notify();
       })
       .child(svg(`mods/workspace-chrome/chevron-${shown ? "down" : "right"}.svg`).size(10).flex_none()))
-    .child(facts(r, took ? `Worked ${took}` : "Work")));
+    .child(facts(r, took ? `Worked ${took}` : "Work", shown)));
   if (shown && (steps || v.editors.has(r.key))) out.push(steps ? stepsView(v, t, r, i) : transcriptView(v, t, r, i));
   out.push(div().text_size(13).text_color(t.foreground).child(TextView.markdown(`answer-${r.key}`, r.answer).selectable(true)));
   return out;

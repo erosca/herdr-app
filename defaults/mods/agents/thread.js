@@ -179,7 +179,7 @@ export function requestFromArgv(argv, agent = null) {
 // Steps: { at, kind, text, detail?, error?, ms? }. kind: think (what it set out to do),
 // say (what it told along the way), run, read, edit, search, fetch, plan, tool.
 // error: true, or a word for it ("exit 1"). ms: how long it took. `detail` is the whole
-// of it where `text` is its first line: a command for a tooltip, what was said in full.
+// of it where `text` is its first line: a whole command, what was said in full.
 const SAID = 20000;
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const firstLine = (s) => s.split("\n").find((l) => l.trim())?.trim() ?? "";
@@ -765,6 +765,17 @@ export function* liveSteps(k, had = null) {
   }) };
 }
 
+/** What a run still going was asked: its request label's file, else its command line,
+ * else what its agent's log has (a prompt on stdin or through a wrapper is only there). */
+export function* requestSteps(k) {
+  let run = yield* recordSteps({ ...k, argv: null });
+  if (!Array.isArray(run.argv)) run = k;
+  const asked = (yield* labelFile(run, "herdr.request")) ?? requestFromArgv(run.argv, agentOf(run));
+  if (asked) return asked;
+  const { rounds } = yield* liveSteps(run);
+  return rounds[rounds.length - 1]?.request ?? null;
+}
+
 // One run that can't be read costs its own round's details, never the others'.
 const unread = (run, e) => [{ ...NOTHING, run, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null,
   transcript: null, cut: false, session: null, live: false, note: `This run couldn't be read: ${why(e)}` }];
@@ -778,3 +789,6 @@ export const finishedRounds = (run) => drive(roundsSteps(run)).catch((e) => unre
 /** A running one's: { rounds, state }; hand `state` back at the next look. */
 export const liveRounds = (run, had = null) => drive(liveSteps(run, had))
   .catch((e) => ({ state: had, rounds: unread(run, e).map((r) => ({ ...r, live: true, end: null })) }));
+
+/** What a running one was asked, or null while that isn't known. */
+export const liveRequest = (run) => drive(requestSteps(run)).catch(() => null);

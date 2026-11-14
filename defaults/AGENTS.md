@@ -161,15 +161,17 @@ the highlighted line shows where it will land.
   `"agents.finished": false` hides them. Clicking one opens its conversation:
   each round's request, its work folded into one line ("Worked 3m 12s · 14 steps ·
   41.2k tokens": inside, each step it took, its terminal output a click further)
-  and its answer as Markdown. A sub-agent still working opens the same window when
-  it is codex or Kimi Code: its request, then its steps and what it says as it goes
-  (the latest ones; the rest a click away), read again from its log every few
-  seconds. That window only reads: keys don't reach the agent. Terminal, in its
-  header, opens the live terminal (`terminal.peek`), where keys do; that terminal's
-  bar has Conversation to come back. Any other running sub-agent, and one that
-  needs the person, opens as its terminal. Another mod opens a running sub-agent's
-  conversation with `openOverlay({ mod: "agents", kind: "dialog", width: 0.8,
-  height: 0.8, props: { conversation: "<address>" } })`. A follow-up
+  and its answer as Markdown; a step cut to one line unfolds on a click. A
+  sub-agent still working opens as its live terminal, what it prints as it prints
+  it; a codex or Kimi Code one under a bar that quotes the request it was sent,
+  with the keyboard kept from the terminal until it is clicked, and the window
+  gives way to the conversation when the agent ends. Steps, in that bar, opens
+  the conversation meanwhile: its steps so far, read again from its log every few
+  seconds, which only reads (Terminal there goes back). Any other running
+  sub-agent, and one that needs the person, opens as the plain peek
+  (`terminal.peek`). Another mod opens a running sub-agent's conversation with
+  `openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
+  conversation: "<address>" } })`. A follow-up
   under the same `--name` and parent, or with the same `herdr.session` label, is
   the next round of the same conversation. Each round comes from the run's labels
   `herdr.request=<file>`, `herdr.answer=<file>` (absolute paths) and
