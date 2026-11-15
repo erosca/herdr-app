@@ -6,21 +6,22 @@
 // lines with the rest a click away), then
 //   - while it works: how long and how far (from the agent's own log), what it is doing
 //     now, and what it prints, as it prints it: read from its terminal every second,
-//     following the newest line until the reader scrolls up;
+//     selectable, the newest line at the bottom until the reader scrolls up, drags the
+//     scroll bar or presses in it to select (then it holds still);
 //   - once done: its work folded into one line (inside: each step from the agent's own
 //     log, its terminal output) and its answer as Markdown. A round that ends while the
 //     window is open turns into this in place.
-// Nothing pops up on hover. Up and Down move between rounds, End follows the newest
-// output again, Esc closes.
+// Nothing pops up on hover. Up and Down move between rounds; Page Up, Page Down and
+// Home scroll the output, End follows its newest line again; Esc closes.
 // Props: { thread: { name, program, asker, parent, names, sessions, addresses },
 //          runs: [finished run records], live: [running ones], find?, overlay },
 //     or { conversation: <a running sub-agent's address>, overlay }.
 // A round's `note` says what couldn't be found or read, under its request.
 
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
 import { props, closeOverlay, settings, terminals, hc } from "herdr";
-import { finishedRounds, liveRounds, liveOutput, wrapLine, inOrder, belongs, fullRecord, threadOf, requestFromArgv, agentOf } from "./thread.js";
+import { finishedRounds, liveRounds, liveOutput, inOrder, belongs, fullRecord, threadOf, requestFromArgv, agentOf } from "./thread.js";
 import { icon, ending, span, clock } from "./util.js";
 
 // A request shows this much until it is unfolded.
@@ -28,11 +29,10 @@ const SHOWN_LINES = 8;
 const SHOWN_CHARS = 900;
 const MAX_STEPS = 400;
 // How often a round still going has its log read again (ms); its output is read every second.
-const EVERY = 5000;
-// The output's rows: their height, and the font's width per pixel of its size.
-const ROW = 18;
+const EVERY = 3000;
+// The output's text size, and about how tall a line of it is (for scrolling by lines).
 const OUT_SIZE = 12;
-const ADVANCE = 0.6;
+const LINE = 18;
 const ICONS = { run: "terminal", read: "file-text", edit: "square-pen", search: "search", fetch: "monitor", plan: "circle-check", tool: "settings" };
 const CUT = "Earlier output isn't kept: herdr-core keeps the last 1,000 lines of a finished sub-agent.";
 
@@ -54,9 +54,12 @@ const waiting = (k) => ({ run: k, live: true, done: false, pending: true, at: k.
   request: requestFromArgv(k.argv, agentOf(k)), answer: null, work: [], steps: null, tokens: null, cached: null,
   ended: null, model: null, effort: null, session: null, note: null, transcript: null, cut: false });
 
-// What a running one printed, as the window keeps it: its lines, their rows at the
-// panel's width (`starts`: each line's first row), and whether the panel follows the end.
-const output = () => ({ lines: [], rows: [], starts: [], cols: 0, at: 0, follow: true, seen: null, reading: false, error: null, copied: 0 });
+// What a running one printed, as the window keeps it: its lines; whether the panel
+// follows the newest, else how many lines are below what it shows (`back`); a drag of
+// its scroll bar under way; the wheel's part of a line not scrolled yet; how many lines
+// the panel takes at most (`fit`, from its last frame: scrolling stops where the first
+// line is in view).
+const output = () => ({ lines: [], at: 0, follow: true, back: 0, drag: false, wheel: 0, fit: 1, reading: false, error: null, copied: 0 });
 
 // `given`: the window's props; tests pass their own, with `rounds` already read.
 export function initConversation(v, cx, given = props()) {
@@ -74,7 +77,6 @@ export function initConversation(v, cx, given = props()) {
   v.states = new Map();
   // What each running one printed.
   v.out = new Map();
-  v.scroll = VirtualListScrollHandle.new();
   // What's open and unfolded, by round (its `key`: its run and its place among that run's rounds).
   v.open = null;
   v.full = new Set();
@@ -206,27 +208,12 @@ function refresh(v, cx, live) {
 
 // --- what a running one prints ---------------------------------------------------------
 
-// How many columns of output fit a panel this wide.
-const colsOf = (width) => Math.max(20, Math.floor((width - 20 - 14) / (OUT_SIZE * ADVANCE)));
-
-// Lines `from` on, their rows recomputed; the rest stay.
-function rewrap(o, lines, from) {
-  const keep = from < o.starts.length ? o.starts[from] : o.rows.length;
-  o.rows.length = keep;
-  o.starts.length = Math.min(from, o.starts.length);
-  for (let i = from; i < lines.length; i++) {
-    o.starts[i] = o.rows.length;
-    for (const row of wrapLine(lines[i], o.cols)) o.rows.push(row);
-  }
-  o.lines = lines;
-}
-
 /** What a running one printed, as a test hands it in: the panel as it would show it. */
-export function setOutput(v, address, text, width = 900) {
+export function setOutput(v, address, text, { back = 0 } = {}) {
   const o = output();
-  o.cols = colsOf(width);
+  o.lines = text.split("\n");
   o.at = Date.now();
-  rewrap(o, text.split("\n"), 0);
+  scrollTo(o, back);
   v.out.set(address, o);
   return o;
 }
@@ -235,7 +222,6 @@ function readOutput(v, cx, k) {
   let o = v.out.get(k.address);
   if (!o) {
     o = output();
-    o.cols = colsOf(outputWidth(v));
     v.out.set(k.address, o);
   }
   if (o.reading) return;
@@ -244,13 +230,11 @@ function readOutput(v, cx, k) {
     try {
       const got = await liveOutput(k, o.lines);
       o.error = null;
-      // Where the reader left the panel, as its last frame showed it: at the end, it
-      // follows what comes; scrolled up, it stays where they are.
-      if (o.seen && o.seen.rows === o.rows.length) o.follow = o.seen.end >= o.rows.length - 1;
       if (got.from < got.lines.length || got.lines.length !== o.lines.length) {
-        rewrap(o, got.lines, Math.min(got.from, o.lines.length));
+        // Held still, the panel keeps showing the same lines while more come below.
+        if (!o.follow) o.back += Math.max(0, got.lines.length - o.lines.length);
+        o.lines = got.lines;
         o.at = Date.now();
-        if (o.follow) v.scroll.scroll_to_bottom();
       }
     } catch (e) {
       o.error = why(e);
@@ -260,14 +244,46 @@ function readOutput(v, cx, k) {
   });
 }
 
-// The panel's width before it is measured: the window's, less what's around it.
-const outputWidth = (v) => (v.size?.width ?? 900) - 28 - 31;
-
-function follow(v, o) {
-  o.follow = true;
-  o.seen = null;
-  v.scroll.scroll_to_bottom();
+// Shows the output with `back` lines below the panel's bottom; none: it follows again.
+function scrollTo(o, back) {
+  o.back = Math.max(0, Math.min(Math.round(back), o.lines.length - o.fit));
+  o.follow = o.back === 0;
 }
+
+// The wheel, in lines: toward the start of the output, or back down to its end.
+function wheel(o, e) {
+  o.wheel += (e.delta?.y ?? 0) / LINE;
+  const step = Math.trunc(o.wheel);
+  if (!step) return false;
+  o.wheel -= step;
+  scrollTo(o, o.back + step);
+  return true;
+}
+
+// The scroll bar's track, in the panel: from 4 px below its top to 4 px above its bottom.
+function bar(o, height, seen) {
+  const total = o.lines.length;
+  const track = height - 8;
+  const thumb = Math.max(24, track * Math.min(1, seen / Math.max(1, total)));
+  const above = Math.max(0, total - o.back - seen);
+  const room = Math.max(1, total - seen);
+  return { track, thumb, top: 4 + (track - thumb) * Math.min(1, above / room), room };
+}
+
+// A press or drag on the track at `y` (in the panel): the thumb's middle goes there.
+function dragTo(o, y, height, seen) {
+  const b = bar(o, height, seen);
+  const at = Math.max(0, Math.min(1, (y - 4 - b.thumb / 2) / Math.max(1, b.track - b.thumb)));
+  scrollTo(o, o.lines.length - Math.round(at * b.room) - seen);
+}
+
+// Text that shows as it is: each line one line, its spaces kept, nothing in it read as Markdown.
+const PUNCTUATION = /[!-/:-@[-`{-~]/g;
+const literal = (lines) => lines.map((l) => {
+  const lead = l.match(/^ */)[0].length;
+  const text = "\u00a0".repeat(lead) + l.slice(lead).replace(PUNCTUATION, "\\$&").replace(/ {2}/g, " \u00a0");
+  return text || "\u00a0";
+}).join("\\\n");
 
 function key(v, e, cx) {
   const rounds = v.rounds ?? [];
@@ -276,11 +292,12 @@ function key(v, e, cx) {
     cx.stop_propagation();
     return;
   }
-  if (e.key === "end") {
-    const r = rounds.find((x) => x.key === v.open);
-    const o = r?.live ? v.out.get(r.run.address) : null;
-    if (!o) return;
-    follow(v, o);
+  // The output of the round open, while it runs: End follows it, the others scroll it.
+  const r = rounds.find((x) => x.key === v.open);
+  const o = r?.live && !r.done ? v.out.get(r.run.address) : null;
+  if (o && ["end", "home", "pageup", "pagedown"].includes(e.key)) {
+    const page = Math.max(1, Math.floor((panelHeight(v, r, rounds.indexOf(r)) - 12) / LINE) - 2);
+    scrollTo(o, e.key === "end" ? 0 : e.key === "home" ? o.lines.length : o.back + (e.key === "pageup" ? page : -page));
     cx.stop_propagation();
     cx.notify();
     return;
@@ -309,7 +326,7 @@ export function conversationView(v, t) {
   const rounds = v.rounds;
   const n = rounds ? rounds.length : runs.length + v.live.length;
   const ran = runs.reduce((sum, r) => sum + Math.max(0, (r.finished_ms ?? r.created_ms ?? 0) - (r.created_ms ?? 0)), 0);
-  const end = going ? { text: going.created_ms != null ? `running ${span(Date.now() - going.created_ms)}` : "running", bad: false } : last ? ending(last) : null;
+  const end = going ? { text: "running", bad: false } : last ? ending(last) : null;
   const facts = [`${n} ${n === 1 ? "round" : "rounds"}`, end?.text, ran ? `ran ${span(ran)}` : null].filter(Boolean);
   let session = null;
   let model = "";
@@ -324,6 +341,15 @@ export function conversationView(v, t) {
     .bg(t.surface)
     .track_focus(v.keys)
     .on_key_down((e, cx) => key(v, e, cx))
+    // A scroll bar let go of anywhere in the window, not only over its panel.
+    .on_mouse_up("left", (_e, cx) => {
+      let was = false;
+      for (const o of v.out.values()) {
+        was = was || o.drag;
+        o.drag = false;
+      }
+      if (was) cx.notify();
+    })
     // The output panel fills what the window leaves.
     .on_size_change((size, cx) => {
       v.size = size;
@@ -455,6 +481,7 @@ function shortened(text) {
   return out.join("\n");
 }
 
+// A link-like button; its click stays its own (a fold it sits in doesn't toggle).
 const link = (t, id, label, onClick) => div()
   .id(id)
   .flex_none()
@@ -466,7 +493,10 @@ const link = (t, id, label, onClick) => div()
   .text_color(t.accent)
   .cursor_pointer()
   .hover((s) => s.bg(t.hover))
-  .on_click(onClick)
+  .on_click((e, cx) => {
+    cx.stop_propagation();
+    onClick(e, cx);
+  })
   .child(label);
 
 // The request its parent sent, as its parent wrote it (Markdown), selectable; a long
@@ -550,18 +580,32 @@ function panelHeight(v, r, i) {
   return Math.max(220, (v.size?.height ?? 640) - above - below);
 }
 
-// What it prints, as it prints it: rows the width of the panel, the newest in view
-// until the reader scrolls up (then a button, or End, follows again).
+// What it prints, as it prints it: one selectable text, its newest line at the bottom of
+// the panel (what doesn't fit is cut off at the top). Scrolled up, a scroll bar dragged
+// or a press in it (a selection starting) holds it still; ↓ Latest or End follows again.
 function outputViews(v, t, r, i) {
   const o = v.out.get(r.run.address);
-  const rows = o?.rows ?? [];
-  const id = `output-${r.key}`;
-  const empty = o?.error ? `Its output couldn't be read: ${o.error}` : o?.lines.length === 0 && !o.reading ? "Nothing printed yet." : "Reading its output…";
+  const height = panelHeight(v, r, i);
+  const total = o?.lines.length ?? 0;
+  // About how many lines are in view, and more than can be: the panel cuts off the rest.
+  const seen = Math.max(1, Math.floor((height - 12) / LINE));
+  // More lines than can be in view (short lines are short), the newest at the panel's
+  // bottom and the rest cut off at its top; scrolled up to the first line, the first
+  // lines at its top instead.
+  const fit = Math.ceil(height / (OUT_SIZE * 1.15)) + 4;
+  if (o) o.fit = fit;
+  const end = total - (o?.back ?? 0);
+  const start = Math.max(0, end - fit);
+  const top = Boolean(o) && !o.follow && start === 0;
+  const shown = o ? o.lines.slice(start, top ? Math.min(total, fit) : end) : [];
+  const b = o && total > seen ? bar(o, height, seen) : null;
+  const asker = v.thread.asker || "its parent";
+  const empty = o?.error ? `Its output couldn't be read: ${o.error}` : o && !o.reading && total === 0 ? "Nothing printed yet." : "Reading its output…";
   return [
     div()
       .id(`panel-${r.key}`)
       .relative()
-      .h(panelHeight(v, r, i))
+      .h(height)
       .rounded(6)
       .border(1)
       .border_color(t.border)
@@ -569,51 +613,77 @@ function outputViews(v, t, r, i) {
       .overflow_hidden()
       .font_family(settings().font_family ?? "JetBrains Mono")
       .text_size(OUT_SIZE)
-      .on_size_change((size, cx) => {
+      .on_scroll_wheel((e, cx) => {
+        if (o && wheel(o, e)) cx.notify();
+      })
+      // A press in the text is a selection starting: the text holds still.
+      .on_mouse_down("left", (_e, cx) => {
         if (!o) return;
-        const cols = colsOf(size.width);
-        if (cols === o.cols) return;
-        o.cols = cols;
-        rewrap(o, o.lines, 0);
-        if (o.follow) v.scroll.scroll_to_bottom();
+        o.drag = false;
+        if (!o.follow) return;
+        o.follow = false;
         cx.notify();
       })
-      .when(rows.length > 0, (el) => el
-        .child(v_virtual_list(id, rows.length, ROW, (n) => String(n), (range) => {
-          // Where the reader is, for the next look to keep them there.
-          if (o && range.end - range.start > 1) o.seen = { end: range.end, rows: rows.length };
-          return rows.slice(range.start, range.end).map((row) => div()
-            .h(ROW)
-            .flex_none()
-            .px(10)
-            .truncate()
-            .text_color(row.k === "cmd" ? t.accent : row.k === "bad" ? t.blocked : t.foreground)
-            .child(row.t || " "));
-        }).track_scroll(v.scroll).size_full().py(6))
-        .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0())
-        .when(Boolean(o) && !o.follow, (el) => el.child(div()
-          .id(`latest-${r.key}`)
-          .absolute()
-          .bottom(10)
-          .right(18)
-          .px(10)
-          .py(3)
-          .rounded(12)
-          .bg(t.popover)
-          .border(1)
-          .border_color(t.input)
-          .text_size(11.5)
-          .text_color(t.foreground)
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => {
-            follow(v, o);
-            cx.notify();
-          })
-          .child("↓ Latest"))))
-      .when(rows.length === 0, (el) => el.child(div().p(12).text_size(12).text_color(t.dim).child(empty))),
-    div().text_size(11).text_color(t.dim)
-      .child(`Read-only: it takes its requests from ${v.thread.asker || "its parent"} alone. To ask it something, ask ${v.thread.asker || "its parent"}.`),
+      .on_mouse_move((e, cx) => {
+        if (!o?.drag || !e.local_position) return;
+        dragTo(o, e.local_position.y, height, seen);
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        if (!o?.drag) return;
+        o.drag = false;
+        cx.notify();
+      })
+      // At least the panel's height: a short output starts at its top.
+      .when(total > 0, (el) => el.child(div()
+        .absolute()
+        .left(0)
+        .right(14)
+        .when(top, (el) => el.top(0))
+        .when(!top, (el) => el.bottom(0))
+        .min_h(height - 2)
+        .px(10)
+        .py(6)
+        .text_color(t.foreground)
+        .child(TextView.markdown(`output-${r.key}`, literal(shown)).selectable(true))))
+      .when(Boolean(b), (el) => el.child(div()
+        .id(`bar-${r.key}`)
+        .absolute()
+        .top(4)
+        .bottom(4)
+        .right(3)
+        .w(8)
+        .cursor_pointer()
+        .on_mouse_down("left", (e, cx) => {
+          cx.stop_propagation();
+          o.drag = true;
+          if (e.local_position) dragTo(o, e.local_position.y + 4, height, seen);
+          cx.notify();
+        })
+        .child(div().absolute().left(1).right(1).top(b.top - 4).h(b.thumb).rounded(4).bg(o.drag ? t.dim : t.input))))
+      .when(Boolean(o) && !o.follow && total > 0, (el) => el.child(div()
+        .id(`latest-${r.key}`)
+        .absolute()
+        .bottom(10)
+        .right(22)
+        .px(10)
+        .py(3)
+        .rounded(12)
+        .bg(t.popover)
+        .border(1)
+        .border_color(t.input)
+        .text_size(11.5)
+        .text_color(t.foreground)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => {
+          scrollTo(o, 0);
+          cx.notify();
+        })
+        .child(o.back > 0 ? `↓ Latest · ${o.back} more ${o.back === 1 ? "line" : "lines"}` : "↓ Latest")))
+      .when(total === 0, (el) => el.child(div().p(12).text_size(12).text_color(t.dim).child(empty))),
+    div().text_size(11).text_color(t.dim).child(`Read-only. To ask it something, ask ${asker}.`),
   ];
 }
 
@@ -706,6 +776,7 @@ function answerViews(v, t, r, i, took) {
   }
   const out = [];
   const shown = v.work.has(r.key);
+  const copied = Date.now() - (v.copied?.get(r.key) ?? 0) < 2000;
   out.push(h_flex()
     .id(`work-${r.key}`)
     .gap(6)
@@ -720,7 +791,15 @@ function answerViews(v, t, r, i, took) {
         cx.notify();
       })
       .child(svg(`mods/workspace-chrome/chevron-${shown ? "down" : "right"}.svg`).size(10).flex_none()))
-    .child(facts(r, took ? `Worked ${took}` : "Work", shown)));
+    .child(div().flex_1().min_w(0).child(facts(r, took ? `Worked ${took}` : "Work", shown)))
+    .child(link(t, `copy-answer-${r.key}`, copied ? "Copied" : "Copy answer", (_e, cx) => {
+      cx.write_to_clipboard(r.answer);
+      v.copied = v.copied ?? new Map();
+      v.copied.set(r.key, Date.now());
+      // "Copied" goes back to "Copy answer" a moment later.
+      cx.timer.after(2100, (cx) => cx.notify());
+      cx.notify();
+    })));
   if (shown && (steps || v.editors.has(r.key))) out.push(steps ? stepsView(v, t, r, i) : transcriptView(v, t, r, i));
   out.push(div().text_size(13).text_color(t.foreground).child(TextView.markdown(`answer-${r.key}`, r.answer).selectable(true)));
   return out;

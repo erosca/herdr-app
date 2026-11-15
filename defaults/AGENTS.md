@@ -166,8 +166,9 @@ the highlighted line shows where it will land.
   of selectable Markdown, its first lines shown until Show all. A codex or Kimi
   Code sub-agent still working opens the same window: its request, how long and
   how far it is (from its log), what it is doing now, and what it prints as it
-  prints it, read from its terminal every second in a panel that follows the
-  newest line until scrolled up (↓ Latest or End follows again). The window
+  prints it, read from its terminal every second as selectable text that follows
+  the newest line; scrolling up, dragging its scroll bar or pressing in it to
+  select holds it still (↓ Latest or End follows again). The window
   only reads: no key reaches the agent, which takes its requests from its
   parent alone; a round that ends while it is open turns into its answer in
   place. Any other running sub-agent, and one that needs the person, opens as

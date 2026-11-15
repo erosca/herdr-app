@@ -154,8 +154,9 @@ def outputs(folder, cases, answers, i):
     """A round still going, drawn with what its run printed: nothing yet, a few lines, a long run of them."""
     long = "\n".join(("$ cargo test --all-features -- --nocapture" if n % 40 == 0 else "  exit 101" if n % 97 == 0 else
                       "    " + "word " * (n % 50)) for n in range(3000))
-    for what, text in (("nothing printed yet", None), ("a few lines", "• Reading the plan.\n  It says **three** steps."), ("3,000 lines, long ones wrapped", long)):
-        build(folder, cases, answers, "view", i, 0, text)
+    for what, text, back in (("nothing printed yet", None, 0), ("a few lines, Markdown in them shown as it is", "• Reading the plan.\n  It says **three** steps.\n# not a heading\n1. not a list <b>nor html</b> \\ `x`", 0),
+                             ("3,000 lines, following the newest", long, 0), ("3,000 lines, scrolled up", long, 1200), ("3,000 lines, at the first", long, 3000)):
+        build(folder, cases, answers, "view", i, 0, {"text": text, "back": back} if text else None)
         ok, out = engine(folder)
         check(ok, "the engine draws \"%s\" with its output: %s" % (cases[i]["name"], what), None if ok else out.strip()[:1200])
 
@@ -194,10 +195,6 @@ def fixture_cases(fx):
         {"name": "splice: the last line rewritten", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 9)] + ["a9 done"], 3]},
         {"name": "splice: they don't meet", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["x", "y", "z", "w"], 3]},
         {"name": "splice: blank lines prove nothing", "call": "spliceLines", "args": [["", "", "", "q"], ["", "", "", "r"], 3]},
-        {"name": "wrap: indented prose", "call": "wrapLine", "args": ["    " + "word " * 30, 40]},
-        {"name": "wrap: a command", "call": "wrapLine", "args": ["$ cargo test", 40]},
-        {"name": "wrap: a failure", "call": "wrapLine", "args": ["  exit 101", 40]},
-        {"name": "wrap: no spaces", "call": "wrapLine", "args": ["x" * 90, 40]},
         {"name": "agentOf", "call": "agentOf", "args": [{"argv": [wrapper, "codex", "/w", "/b.md", "/r.md"]}]},
         {"name": "agentOf: a script", "call": "agentOf", "args": [{"argv": ["sh", "-c", "cd w && ~/.kimi-code/bin/kimi -p hi"]}]},
         {"name": "agentOf: what Herdr saw running", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": CODEX}]},
@@ -361,13 +358,6 @@ def expect(fx, reports, answers):
           [result("splice: more printed"), result("splice: nothing new")])
     check(result("splice: the last line rewritten") == {"lines": a[:9] + ["a9 done"], "from": 9}, "a line rewritten in place (a progress line) is taken as it is now",
           result("splice: the last line rewritten"))
-    rows = result("wrap: indented prose") or []
-    words = " ".join(r["t"].strip() for r in rows).split()
-    check(len(rows) > 1 and all(len(r["t"]) <= 40 for r in rows) and all(r["t"].startswith("    ") for r in rows) and words == ["word"] * 30,
-          "output wraps at spaces to the panel's width, the rows after the first keep the line's indent, no word lost", rows)
-    check(((result("wrap: a command") or [{}])[0].get("k"), (result("wrap: a failure") or [{}])[0].get("k"), [len(r["t"]) for r in result("wrap: no spaces") or []]) ==
-          ("cmd", "bad", [40, 40, 10]), "a command and a failed exit are told apart; a line with no space breaks where it must",
-          [result("wrap: a command"), result("wrap: a failure"), result("wrap: no spaces")])
     check((result("asked: a label"), asked("asked: a label")) == (fixtures.LREQUEST, ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]]),
           "what a running one was asked, for the bar over its terminal: from its label's file, its log not read", asked("asked: a label"))
     check((result("asked: on the command line"), asked("asked: on the command line")) == ("One more: check the docs as well.", ["hc get t90"]),

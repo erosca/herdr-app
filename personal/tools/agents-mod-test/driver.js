@@ -6,8 +6,8 @@
 //     to run and ask again;
 //   - MODE "report" throws what each case came to, for check.py to compare;
 //   - MODE "view" renders one case's conversation window for real: a wrong element
-//     method or argument fails the check. A round still going shows OUTPUT as what its
-//     run printed (null: nothing yet).
+//     method or argument fails the check. A round still going shows OUTPUT.text as what
+//     its run printed, scrolled OUTPUT.back lines up (null: nothing printed yet).
 
 import { View } from "gpui-kit";
 import { theme } from "herdr";
@@ -93,7 +93,7 @@ export default class Driver extends View {
     const c = CASES[VIEW];
     const rounds = this.done[VIEW].rounds;
     initConversation(this, cx, { thread: c.thread, runs: c.runs ?? [], live: c.live ?? [], rounds, overlay: "check" });
-    if (OUTPUT != null) for (const r of rounds) if (r.live) setOutput(this, r.run.address, OUTPUT);
+    if (OUTPUT != null) for (const r of rounds) if (r.live) setOutput(this, r.run.address, OUTPUT.text, { back: OUTPUT.back });
     if (OPEN == null) return;
     // One round open with everything in it unfolded: its whole request, its steps (each
     // to its whole text), its terminal output.

@@ -851,30 +851,6 @@ export function* outputSteps(run, had = null) {
   return { lines: lines.length > KEEP ? lines.slice(-(KEEP - DROP)) : lines, from: 0 };
 }
 
-/** One line of output as the rows a reader of `cols` columns sees it in: broken at a
- * space where there is one in its second half, else where it must; the rows after the
- * first keep its indent (up to a third of the width). A kind for each: `cmd` for a
- * command shown as `$ ...`, `bad` for an `exit N` that isn't 0, else none. */
-export function wrapLine(line, cols) {
-  const kind = /^\s*\$ /.test(line) ? "cmd" : /^\s*exit [1-9]\d*\s*$/.test(line) ? "bad" : "";
-  cols = Math.max(20, cols);
-  if (line.length <= cols) return [{ t: line, k: kind }];
-  const indent = Math.min(line.match(/^ */)[0].length, Math.floor(cols / 3));
-  const pad = " ".repeat(indent);
-  const rows = [];
-  let rest = line;
-  let room = cols;
-  while (rest.length > room) {
-    let cut = rest.lastIndexOf(" ", room);
-    if (cut < room / 2 || !rest.slice(0, cut).trim()) cut = room;
-    rows.push({ t: (rows.length ? pad : "") + rest.slice(0, cut).replace(/\s+$/, ""), k: kind });
-    rest = rest.slice(cut).replace(/^ +/, "");
-    room = cols - indent;
-  }
-  rows.push({ t: (rows.length ? pad : "") + rest, k: kind });
-  return rows;
-}
-
 // One run that can't be read costs its own round's details, never the others'.
 const unread = (run, e) => [{ ...NOTHING, run, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null,
   transcript: null, cut: false, session: null, live: false, note: `This run couldn't be read: ${why(e)}` }];
