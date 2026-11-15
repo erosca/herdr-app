@@ -30,18 +30,9 @@ export function clock(ms) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-// The windows a sub-agent opens as, as openOverlay takes them. Both are as big as a peek.
+// The window a sub-agent opens as, as openOverlay takes it: as big as a peek.
 const BIG = { kind: "dialog", width: 0.8, height: 0.8 };
 
 /** Its conversation: each round's request, work and answer. `find`: the conversation's
  * finished runs are asked of the core first (the opener's list may lack the newest). */
 export const conversationOf = (thread, runs, live, find = false) => ({ mod: "agents", ...BIG, props: { thread, runs, live, find } });
-
-// How tall the bar over a watched terminal is: its header, and its request's first lines.
-export const WATCH_HEAD = 168;
-
-/** A running one's live terminal, under a bar with the request it was sent (watch.js). */
-export const watchOf = (thread, runs, k) => ({ ...BIG, layout: { type: "column", children: [
-  { type: "block", size: { px: WATCH_HEAD }, content: { mod: "agents", props: { watch: { thread, runs, live: k } } } },
-  { type: "block", content: { terminal: k.address } },
-] } });

@@ -1,35 +1,43 @@
-// The conversation window of a sub-agent, finished or still working: one round per
-// request its parent sent. Each round shows the request (a quoted block), then
-//   - finished: the work folded into one line (inside: each step from the agent's own
-//     log, what it said along the way as Markdown, else its terminal output) and the
-//     answer as Markdown;
-//   - still working: the same steps as they happen, read again every few seconds from
-//     the agent's log, the latest ones shown. The window only reads: nothing typed here
-//     reaches the agent. Its live terminal is one click away (Terminal, in the header).
-// A step cut to one line unfolds in place when clicked. Nothing here pops up on hover.
-// Older rounds start folded, the newest open; Up and Down move between rounds, Esc closes.
+// The conversation window of a sub-agent: one round per request its parent sent, the
+// same window while it works and once it is done. It only reads: nothing typed here
+// reaches the agent, which takes its requests from its parent alone.
+//
+// Each round shows the request its parent sent (a quoted block, as Markdown, its first
+// lines with the rest a click away), then
+//   - while it works: how long and how far (from the agent's own log), what it is doing
+//     now, and what it prints, as it prints it: read from its terminal every second,
+//     following the newest line until the reader scrolls up;
+//   - once done: its work folded into one line (inside: each step from the agent's own
+//     log, its terminal output) and its answer as Markdown. A round that ends while the
+//     window is open turns into this in place.
+// Nothing pops up on hover. Up and Down move between rounds, End follows the newest
+// output again, Esc closes.
 // Props: { thread: { name, program, asker, parent, names, sessions, addresses },
 //          runs: [finished run records], live: [running ones], find?, overlay },
 //     or { conversation: <a running sub-agent's address>, overlay }.
-// While open it follows the conversation: a follow-up that starts or ends shows up.
 // A round's `note` says what couldn't be found or read, under its request.
 
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { props, closeOverlay, openOverlay, settings, terminals, hc } from "herdr";
-import { finishedRounds, liveRounds, inOrder, belongs, fullRecord, threadOf } from "./thread.js";
-import { icon, ending, span, clock, watchOf } from "./util.js";
+import { v_flex, h_flex, Editor, EditorState, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { props, closeOverlay, settings, terminals, hc } from "herdr";
+import { finishedRounds, liveRounds, liveOutput, wrapLine, inOrder, belongs, fullRecord, threadOf, requestFromArgv, agentOf } from "./thread.js";
+import { icon, ending, span, clock } from "./util.js";
 
+// A request shows this much until it is unfolded.
 const SHOWN_LINES = 8;
+const SHOWN_CHARS = 900;
 const MAX_STEPS = 400;
-// Of a round still going, the latest steps show: what's new stays in view without scrolling.
-const LATEST = 12;
-// How often a round still going is read again (ms).
-const EVERY = 3000;
+// How often a round still going has its log read again (ms); its output is read every second.
+const EVERY = 5000;
+// The output's rows: their height, and the font's width per pixel of its size.
+const ROW = 18;
+const OUT_SIZE = 12;
+const ADVANCE = 0.6;
 const ICONS = { run: "terminal", read: "file-text", edit: "square-pen", search: "search", fetch: "monitor", plan: "circle-check", tool: "settings" };
 const CUT = "Earlier output isn't kept: herdr-core keeps the last 1,000 lines of a finished sub-agent.";
 
 const liveKey = (list) => list.map((k) => k.address).sort().join(" ");
+const why = (e) => String(e?.message ?? e).split("\n")[0];
 
 // A running sub-agent by its address alone: its conversation, and who it answers to.
 function byAddress(address) {
@@ -40,6 +48,15 @@ function byAddress(address) {
   return { thread: { ...threadOf([k]), name: k.name || k.template || k.program?.name || k.address, program: k.program ?? null,
     asker: parent?.program?.name || parent?.name || "Parent" }, runs: [], live: [k] };
 }
+
+// A round still going, before its log is read: its request when its command line has it.
+const waiting = (k) => ({ run: k, live: true, done: false, pending: true, at: k.created_ms ?? null, end: null,
+  request: requestFromArgv(k.argv, agentOf(k)), answer: null, work: [], steps: null, tokens: null, cached: null,
+  ended: null, model: null, effort: null, session: null, note: null, transcript: null, cut: false });
+
+// What a running one printed, as the window keeps it: its lines, their rows at the
+// panel's width (`starts`: each line's first row), and whether the panel follows the end.
+const output = () => ({ lines: [], rows: [], starts: [], cols: 0, at: 0, follow: true, seen: null, reading: false, error: null, copied: 0 });
 
 // `given`: the window's props; tests pass their own, with `rounds` already read.
 export function initConversation(v, cx, given = props()) {
@@ -55,6 +72,9 @@ export function initConversation(v, cx, given = props()) {
   // What was read: each finished run's rounds (once), and where each running one's log was read to.
   v.done = new Map();
   v.states = new Map();
+  // What each running one printed.
+  v.out = new Map();
+  v.scroll = VirtualListScrollHandle.new();
   // What's open and unfolded, by round (its `key`: its run and its place among that run's rounds).
   v.open = null;
   v.full = new Set();
@@ -62,6 +82,8 @@ export function initConversation(v, cx, given = props()) {
   v.term = new Set();
   // Steps unfolded to their whole text, by round and place.
   v.steps = new Set();
+  // Measured heights, for the output panel to fill what the window leaves.
+  v.tops = new Map();
   v.editors = new Map();
   v.size = null;
   v.keys = cx.focus_handle();
@@ -69,20 +91,31 @@ export function initConversation(v, cx, given = props()) {
   v.seen = liveKey(v.live);
   v.at = 0;
   if (p.rounds) return show(v, p.rounds);
+  // A round still going shows at once, and its output with it; the rest follows.
+  if (v.live.length) {
+    show(v, v.live.map(waiting));
+    for (const k of v.live) readOutput(v, cx, k);
+  }
   // With a run still going, opened by address alone or told to (`find`), the
   // conversation's finished runs are asked of the core first: the list the window was
   // opened from may lack them.
   if (v.live.length || !asked.thread || asked.find) refresh(v, cx, v.live);
   else load(v, cx);
-  cx.timer.every(1000, (cx) => {
-    if (v.loading) return;
+  cx.timer.every(1000, (cx) => tick(v, cx));
+}
+
+function tick(v, cx) {
+  if (!v.loading) {
     const live = terminals().filter((k) => k.state === "live" && belongs(v.thread, k));
     // A follow-up starting, or a running round ending: read the conversation's runs again.
     if (liveKey(live) !== v.seen) {
       v.seen = liveKey(live);
       refresh(v, cx, live);
     } else if (v.live.length && Date.now() - v.at >= EVERY) load(v, cx);
-  });
+  }
+  for (const k of v.live) readOutput(v, cx, k);
+  // The time it has run, while a round runs.
+  if (v.live.length) cx.notify();
 }
 
 // Reads what isn't read yet: finished runs once, running ones on from the last look.
@@ -159,9 +192,10 @@ function refresh(v, cx, live) {
       v.runs = [...v.runs.filter((k) => !known.has(k.address)), ...finished.map(named)]
         .sort((x, y) => (x.created_ms ?? 0) - (y.created_ms ?? 0));
       v.live = live.map(named);
-      // A run that ended is read whole, as a finished one.
+      // A run that ended is read whole, as a finished one; what it printed is in that round.
       const going = new Set(v.live.map((k) => k.address));
       for (const a of [...v.states.keys()]) if (!going.has(a)) v.states.delete(a);
+      for (const a of [...v.out.keys()]) if (!going.has(a)) v.out.delete(a);
       v.thread = { ...v.thread, addresses: [...new Set([...(v.thread.addresses ?? []), ...v.runs.map((k) => k.address), ...v.live.map((k) => k.address)])] };
     } catch (_) {
       // The next change tries again.
@@ -170,11 +204,85 @@ function refresh(v, cx, live) {
   });
 }
 
+// --- what a running one prints ---------------------------------------------------------
+
+// How many columns of output fit a panel this wide.
+const colsOf = (width) => Math.max(20, Math.floor((width - 20 - 14) / (OUT_SIZE * ADVANCE)));
+
+// Lines `from` on, their rows recomputed; the rest stay.
+function rewrap(o, lines, from) {
+  const keep = from < o.starts.length ? o.starts[from] : o.rows.length;
+  o.rows.length = keep;
+  o.starts.length = Math.min(from, o.starts.length);
+  for (let i = from; i < lines.length; i++) {
+    o.starts[i] = o.rows.length;
+    for (const row of wrapLine(lines[i], o.cols)) o.rows.push(row);
+  }
+  o.lines = lines;
+}
+
+/** What a running one printed, as a test hands it in: the panel as it would show it. */
+export function setOutput(v, address, text, width = 900) {
+  const o = output();
+  o.cols = colsOf(width);
+  o.at = Date.now();
+  rewrap(o, text.split("\n"), 0);
+  v.out.set(address, o);
+  return o;
+}
+
+function readOutput(v, cx, k) {
+  let o = v.out.get(k.address);
+  if (!o) {
+    o = output();
+    o.cols = colsOf(outputWidth(v));
+    v.out.set(k.address, o);
+  }
+  if (o.reading) return;
+  o.reading = true;
+  cx.spawn(async (cx) => {
+    try {
+      const got = await liveOutput(k, o.lines);
+      o.error = null;
+      // Where the reader left the panel, as its last frame showed it: at the end, it
+      // follows what comes; scrolled up, it stays where they are.
+      if (o.seen && o.seen.rows === o.rows.length) o.follow = o.seen.end >= o.rows.length - 1;
+      if (got.from < got.lines.length || got.lines.length !== o.lines.length) {
+        rewrap(o, got.lines, Math.min(got.from, o.lines.length));
+        o.at = Date.now();
+        if (o.follow) v.scroll.scroll_to_bottom();
+      }
+    } catch (e) {
+      o.error = why(e);
+    }
+    o.reading = false;
+    cx.notify();
+  });
+}
+
+// The panel's width before it is measured: the window's, less what's around it.
+const outputWidth = (v) => (v.size?.width ?? 900) - 28 - 31;
+
+function follow(v, o) {
+  o.follow = true;
+  o.seen = null;
+  v.scroll.scroll_to_bottom();
+}
+
 function key(v, e, cx) {
   const rounds = v.rounds ?? [];
   if (e.key === "escape") {
     closeOverlay(props().overlay);
     cx.stop_propagation();
+    return;
+  }
+  if (e.key === "end") {
+    const r = rounds.find((x) => x.key === v.open);
+    const o = r?.live ? v.out.get(r.run.address) : null;
+    if (!o) return;
+    follow(v, o);
+    cx.stop_propagation();
+    cx.notify();
     return;
   }
   if (!rounds.length) return;
@@ -188,6 +296,10 @@ function key(v, e, cx) {
   cx.notify();
 }
 
+// --- the window ---------------------------------------------------------------------------
+
+const modelOf = (r) => [r.model, r.effort].filter(Boolean).join(" ");
+
 export function conversationView(v, t) {
   const p = props() ?? {};
   const th = v.thread;
@@ -197,10 +309,14 @@ export function conversationView(v, t) {
   const rounds = v.rounds;
   const n = rounds ? rounds.length : runs.length + v.live.length;
   const ran = runs.reduce((sum, r) => sum + Math.max(0, (r.finished_ms ?? r.created_ms ?? 0) - (r.created_ms ?? 0)), 0);
-  const end = going ? { text: "running", bad: false } : last ? ending(last) : null;
+  const end = going ? { text: going.created_ms != null ? `running ${span(Date.now() - going.created_ms)}` : "running", bad: false } : last ? ending(last) : null;
   const facts = [`${n} ${n === 1 ? "round" : "rounds"}`, end?.text, ran ? `ran ${span(ran)}` : null].filter(Boolean);
   let session = null;
-  for (const r of rounds ?? []) session = r.session ?? session;
+  let model = "";
+  for (const r of rounds ?? []) {
+    session = r.session ?? session;
+    model = modelOf(r) || model;
+  }
   const pic = icon(th.program, 16, t.foreground);
   return v_flex()
     .id("conversation")
@@ -208,7 +324,7 @@ export function conversationView(v, t) {
     .bg(t.surface)
     .track_focus(v.keys)
     .on_key_down((e, cx) => key(v, e, cx))
-    // An output with nothing else in its round fills what the window leaves.
+    // The output panel fills what the window leaves.
     .on_size_change((size, cx) => {
       v.size = size;
       cx.notify();
@@ -223,29 +339,14 @@ export function conversationView(v, t) {
       .border_color(t.border)
       .when(Boolean(pic), (el) => el.child(pic))
       .child(div().flex_none().text_size(13).font_medium().text_color(t.foreground).child(th.name || last?.name || going?.name || ""))
+      .when(Boolean(model), (el) => el.child(div().flex_none().px(6).py(1).rounded(4).bg(t.raised).text_size(11).text_color(t.muted).child(model)))
+      .when(Boolean(going), (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(end?.bad ? t.blocked : t.dim).child(facts.join(" · ")))
       .when(Boolean(session), (el) => el.child(div()
-        .id("session")
         .flex_none()
         .text_size(11)
         .text_color(t.dim)
         .child(`session ${String(session).replace(/^session_/, "").slice(0, 8)}`)))
-      // This window only reads. Its live terminal is what it prints as it prints it, and where to type into it.
-      .when(Boolean(going), (el) => el.child(div()
-        .id("conversation-terminal")
-        .flex_none()
-        .px(8)
-        .py(2)
-        .rounded(5)
-        .text_size(11.5)
-        .text_color(t.accent)
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover))
-        .on_click(() => {
-          closeOverlay(p.overlay);
-          openOverlay(watchOf(th, runs, going));
-        })
-        .child("Terminal")))
       .child(div()
         .id("conversation-close")
         .p(3)
@@ -297,13 +398,34 @@ function roundView(v, t, r, i, rounds) {
     .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none().text_color(t.dim))
     .child(div().flex_none().text_size(12).font_medium().text_color(open ? t.foreground : t.muted).child(`Round ${i + 1}`))
     .child(div().flex_none().text_size(11.5).text_color(t.dim)
-      .child([r.at != null ? clock(r.at) : null, when].filter(Boolean).join(" · ")))
+      .child([r.at != null ? clock(r.at) : null, when, modelOf(r) || null].filter(Boolean).join(" · ")))
     // Its parent started it over: the sub-agent didn't remember the rounds before.
     .when(Boolean(fresh), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("· new session")))
     .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(open ? "" : first))
     .when(Boolean(r.live), (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
     .when(Boolean(end), (el) => el.child(div().flex_none().text_size(11).text_color(end.bad ? t.blocked : t.dim).child(end.text)));
   if (!open) return head;
+  if (busy) {
+    return v_flex()
+      .flex_none()
+      .gap(6)
+      .pb(12)
+      .child(head)
+      .child(v_flex().pl(25).pr(6).gap(10)
+        // What's above the output, measured: the panel takes the rest of the window.
+        .child(v_flex()
+          .id(`top-${r.key}`)
+          .gap(10)
+          .on_size_change((size, cx) => {
+            if (v.tops.get(r.key) === size.height) return;
+            v.tops.set(r.key, size.height);
+            cx.notify();
+          })
+          .child(requestView(v, t, r))
+          .when(Boolean(r.note), (el) => el.child(noteView(t, r)))
+          .children(statusViews(v, t, r)))
+        .children(outputViews(v, t, r, i)));
+  }
   return v_flex()
     .flex_none()
     .gap(6)
@@ -315,12 +437,48 @@ function roundView(v, t, r, i, rounds) {
       .children(answerViews(v, t, r, i, took)));
 }
 
+// The request's first lines, for a request folded: whole lines, a code block left open closed.
+function shortened(text) {
+  const lines = text.split("\n");
+  const out = [];
+  let chars = 0;
+  let fenced = false;
+  for (const l of lines) {
+    if (out.length >= SHOWN_LINES || (out.length && chars + l.length > SHOWN_CHARS)) break;
+    out.push(l.length > SHOWN_CHARS ? `${l.slice(0, SHOWN_CHARS)}…` : l);
+    chars += l.length + 1;
+    if (/^\s*(```|~~~)/.test(l)) fenced = !fenced;
+    if (l.length > SHOWN_CHARS) break;
+  }
+  if (out.length === lines.length && chars <= SHOWN_CHARS + 1) return null;
+  if (fenced) out.push("```");
+  return out.join("\n");
+}
+
+const link = (t, id, label, onClick) => div()
+  .id(id)
+  .flex_none()
+  .px(6)
+  .py(1)
+  .ml(-6)
+  .rounded(4)
+  .text_size(11.5)
+  .text_color(t.accent)
+  .cursor_pointer()
+  .hover((s) => s.bg(t.hover))
+  .on_click(onClick)
+  .child(label);
+
+// The request its parent sent, as its parent wrote it (Markdown), selectable; a long
+// one folded to its first lines.
 function requestView(v, t, r) {
   const th = v.thread;
-  const lines = (r.request ?? "").replace(/\s+$/, "").split("\n");
+  const text = (r.request ?? "").replace(/\s+$/, "");
   const all = v.full.has(r.key);
+  const short = text ? shortened(text) : null;
+  const lines = text.split("\n").length;
   return v_flex()
-    .gap(3)
+    .gap(4)
     .px(12)
     .py(9)
     .rounded(6)
@@ -328,24 +486,136 @@ function requestView(v, t, r) {
     .border_l(2)
     .border_color(t.accent)
     .child(div().text_size(11).text_color(t.dim).child(`${th.asker || "Parent"} → ${th.name ?? ""}`))
-    .when(!r.request, (el) => el.child(div().text_size(12.5).text_color(t.dim).child("The request wasn't recorded.")))
-    .when(Boolean(r.request), (el) => el.children((all ? lines : lines.slice(0, SHOWN_LINES))
-      .map((l) => div().text_size(12.5).text_color(t.foreground).child(l || " "))))
-    .when(Boolean(r.request) && lines.length > SHOWN_LINES, (el) => el.child(div()
-      .id(`request-all-${r.key}`)
-      .mt(2)
-      .text_size(11.5)
-      .text_color(t.accent)
-      .cursor_pointer()
-      .on_click((_e, cx) => {
-        all ? v.full.delete(r.key) : v.full.add(r.key);
-        cx.notify();
-      })
-      .child(all ? "Show less" : `Show all ${lines.length} lines`)));
+    .when(!text, (el) => el.child(div().text_size(12.5).text_color(t.dim).child(r.pending ? "Reading its request…" : "The request wasn't recorded.")))
+    .when(Boolean(text), (el) => el.child(div().text_size(12.5).text_color(t.foreground)
+      .child(TextView.markdown(`request-${r.key}`, short && !all ? short : text).selectable(true))))
+    .when(Boolean(short), (el) => el.child(link(t, `request-all-${r.key}`, all ? "Show less" : `Show all ${lines} lines`, (_e, cx) => {
+      all ? v.full.delete(r.key) : v.full.add(r.key);
+      cx.notify();
+    })));
 }
 
 // What couldn't be found or read for this round, in a line.
 const noteView = (t, r) => div().text_size(11).text_color(t.dim).child(r.note);
+
+const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+// Tokens: what the model read anew and wrote. What it re-read from its cache each time
+// is far more and says little: named only where there is room, in an open fold's line.
+const facts = (r, lead, cache = false) => [lead, r.steps != null ? `${r.steps} ${r.steps === 1 ? "step" : "steps"}` : null,
+  r.tokens ? `${tokens(r.tokens)} tokens${cache && r.cached ? ` read anew and written, ${tokens(r.cached)} more re-read from cache` : ""}` : null].filter(Boolean).join(" · ");
+
+// A round still going: how long and how far, from its log; what it is doing now; and
+// whether it has been quiet (a long command, or an agent that is stuck).
+function statusViews(v, t, r) {
+  const o = v.out.get(r.run.address);
+  const now = r.work?.[r.work.length - 1];
+  const quiet = Date.now() - Math.max(o?.at ?? 0, r.seen ?? 0, r.at ?? 0);
+  const copied = o && Date.now() - o.copied < 2000;
+  const out = [h_flex()
+    .gap(8)
+    .items_center()
+    .text_size(11.5)
+    .text_color(t.dim)
+    .child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900))
+    .child(div().flex_none().child(facts(r, r.at != null ? `Working ${span(Date.now() - r.at)}` : "Working")))
+    .when(quiet >= 60000, (el) => el.child(div().flex_none().child(`· nothing new for ${span(quiet)}`)))
+    .child(div().flex_1())
+    .when(Boolean(o?.lines.length), (el) => el.child(link(t, `copy-${r.key}`, copied ? "Copied" : "Copy output", (_e, cx) => {
+      cx.write_to_clipboard(o.lines.join("\n"));
+      o.copied = Date.now();
+      cx.notify();
+    })))];
+  if (now) {
+    const say = now.kind === "say";
+    out.push(h_flex()
+      .gap(8)
+      .items_center()
+      .text_size(12)
+      .child(div().flex_none().text_size(11).text_color(t.dim).child("Now"))
+      .child(h_flex().w(14).h(12).flex_none().items_center().justify_center()
+        .child(ICONS[now.kind] ? svg(`mods/workspace-chrome/${ICONS[now.kind]}.svg`).size(12).text_color(t.dim) : div().size(5).rounded(3).bg(t.muted)))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.muted)
+        .when(now.kind === "run", (el) => el.font_family(settings().font_family))
+        .child(say ? (now.detail ?? now.text).split("\n").find((l) => l.trim()) ?? now.text : now.text)));
+  }
+  return out;
+}
+
+// The output panel's height: what the window leaves under the request and the status.
+function panelHeight(v, r, i) {
+  const top = v.tops.get(r.key) ?? 160;
+  const above = 41 + 10 + 30 * i + 28 + 6 + top + 10;
+  const below = 10 + 16 + 12 + 10;
+  return Math.max(220, (v.size?.height ?? 640) - above - below);
+}
+
+// What it prints, as it prints it: rows the width of the panel, the newest in view
+// until the reader scrolls up (then a button, or End, follows again).
+function outputViews(v, t, r, i) {
+  const o = v.out.get(r.run.address);
+  const rows = o?.rows ?? [];
+  const id = `output-${r.key}`;
+  const empty = o?.error ? `Its output couldn't be read: ${o.error}` : o?.lines.length === 0 && !o.reading ? "Nothing printed yet." : "Reading its output…";
+  return [
+    div()
+      .id(`panel-${r.key}`)
+      .relative()
+      .h(panelHeight(v, r, i))
+      .rounded(6)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.background)
+      .overflow_hidden()
+      .font_family(settings().font_family ?? "JetBrains Mono")
+      .text_size(OUT_SIZE)
+      .on_size_change((size, cx) => {
+        if (!o) return;
+        const cols = colsOf(size.width);
+        if (cols === o.cols) return;
+        o.cols = cols;
+        rewrap(o, o.lines, 0);
+        if (o.follow) v.scroll.scroll_to_bottom();
+        cx.notify();
+      })
+      .when(rows.length > 0, (el) => el
+        .child(v_virtual_list(id, rows.length, ROW, (n) => String(n), (range) => {
+          // Where the reader is, for the next look to keep them there.
+          if (o && range.end - range.start > 1) o.seen = { end: range.end, rows: rows.length };
+          return rows.slice(range.start, range.end).map((row) => div()
+            .h(ROW)
+            .flex_none()
+            .px(10)
+            .truncate()
+            .text_color(row.k === "cmd" ? t.accent : row.k === "bad" ? t.blocked : t.foreground)
+            .child(row.t || " "));
+        }).track_scroll(v.scroll).size_full().py(6))
+        .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0())
+        .when(Boolean(o) && !o.follow, (el) => el.child(div()
+          .id(`latest-${r.key}`)
+          .absolute()
+          .bottom(10)
+          .right(18)
+          .px(10)
+          .py(3)
+          .rounded(12)
+          .bg(t.popover)
+          .border(1)
+          .border_color(t.input)
+          .text_size(11.5)
+          .text_color(t.foreground)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => {
+            follow(v, o);
+            cx.notify();
+          })
+          .child("↓ Latest"))))
+      .when(rows.length === 0, (el) => el.child(div().p(12).text_size(12).text_color(t.dim).child(empty))),
+    div().text_size(11).text_color(t.dim)
+      .child(`Read-only: it takes its requests from ${v.thread.asker || "its parent"} alone. To ask it something, ask ${v.thread.asker || "its parent"}.`),
+  ];
+}
 
 // The output box's height when it's all its round has: the window less what's above it.
 function fillHeight(v, r, i) {
@@ -362,8 +632,6 @@ function transcriptView(v, t, r, i, fill = false) {
     .when(r.cut, (el) => el.child(div().text_size(11).text_color(t.dim).child(CUT)))
     .child(v_flex().h(fill ? fillHeight(v, r, i) : 320).rounded(6).border(1).border_color(t.border).child(Editor.new(v.editors.get(r.key).state).flex_1().min_h(0)));
 }
-
-const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
 // Time into the round: 0:42, 12:05, 1:02:10.
 function offset(ms) {
@@ -422,62 +690,14 @@ function stepsView(v, t, r, i) {
     .py(2)
     .when(hidden > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(`${hidden} earlier steps aren't shown`)))
     .children(stepRows(v, t, r, hidden))
-    .when(Boolean(r.transcript), (el) => el.child(div()
-      .id(`terminal-${r.key}`)
-      .mt(6)
-      .text_size(11.5)
-      .text_color(t.accent)
-      .cursor_pointer()
-      .on_click((_e, cx) => {
-        term ? v.term.delete(r.key) : v.term.add(r.key);
-        cx.notify();
-      })
-      .child(term ? "Hide terminal output" : "Terminal output")))
+    .when(Boolean(r.transcript), (el) => el.child(link(t, `terminal-${r.key}`, term ? "Hide terminal output" : "Terminal output", (_e, cx) => {
+      term ? v.term.delete(r.key) : v.term.add(r.key);
+      cx.notify();
+    }).mt(6)))
     .when(term && v.editors.has(r.key), (el) => el.child(transcriptView(v, t, r, i)));
 }
 
-// Tokens: what the model read anew and wrote. What it re-read from its cache each time
-// is far more and says little: named only where there is room, in an open fold's line.
-const facts = (r, lead, cache = false) => [lead, r.steps != null ? `${r.steps} ${r.steps === 1 ? "step" : "steps"}` : null,
-  r.tokens ? `${tokens(r.tokens)} tokens${cache && r.cached ? ` read anew and written, ${tokens(r.cached)} more re-read from cache` : ""}` : null].filter(Boolean).join(" · ");
-
-// A round still going: how long and how much so far, then its steps as a finished
-// round's fold shows them, the latest ones (all of them one click away). A log that
-// hasn't been written to for a minute says so: a long command, or an agent that's stuck.
-function workingViews(v, t, r) {
-  const all = v.work.has(r.key);
-  const n = r.work.length;
-  const from = Math.max(0, n - (all ? MAX_STEPS : LATEST));
-  const quiet = r.seen != null ? Date.now() - r.seen : 0;
-  const out = [h_flex()
-    .id(`working-${r.key}`)
-    .gap(8)
-    .items_center()
-    .text_size(11.5)
-    .text_color(t.dim)
-    .child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900))
-    .child(facts(r, r.at != null ? `Working ${span(Date.now() - r.at)}` : "Working"))
-    .when(quiet >= 60000, (el) => el.child(`· nothing new for ${span(quiet)}`))];
-  if (n > LATEST) {
-    out.push(div()
-      .id(`earlier-${r.key}`)
-      .text_size(11.5)
-      .text_color(t.accent)
-      .cursor_pointer()
-      .on_click((_e, cx) => {
-        all ? v.work.delete(r.key) : v.work.add(r.key);
-        cx.notify();
-      })
-      .child(all ? `Show only the latest ${LATEST} steps` : `Show ${from} earlier steps`));
-  }
-  if (all && from > 0) out.push(div().text_size(11).text_color(t.dim).child(`${from} earlier steps aren't shown`));
-  if (n) out.push(v_flex().gap(2).children(stepRows(v, t, r, from)));
-  else if (!r.note) out.push(div().text_size(12).text_color(t.dim).child("Nothing in its log yet."));
-  return out;
-}
-
 function answerViews(v, t, r, i, took) {
-  if (r.live && !r.answer) return workingViews(v, t, r);
   const steps = r.work?.length > 0;
   if (!r.answer) {
     if (steps) return [div().text_size(12).text_color(t.dim).child(`It ended without an answer${r.ended ? ` (${r.ended})` : ""}. What it did:`), stepsView(v, t, r, i)];

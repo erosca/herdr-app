@@ -9,7 +9,8 @@
 //   3. the terminal: its command line and the last 1000 lines herdr-core keeps.
 // A run's log is the session named on its command line, else the one in the run's
 // folder with a turn that began while the run was alive. A run still going is read the
-// same way, and read on from where the last look ended (liveSteps).
+// same way, and read on from where the last look ended (liveSteps); what it prints is
+// read from its terminal as it prints it (outputSteps).
 
 import { hc, exec, readTextFile } from "herdr";
 
@@ -286,6 +287,8 @@ function codexItem(it, at, cwd) {
 export function readRollout(text, { cwd = null } = {}) {
   const out = { rounds: [] };
   let round = null;
+  // The model and effort of the turn about to start (codex writes them ahead of its request).
+  let ctx = { model: null, effort: null };
   const seen = new Set();
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
@@ -293,6 +296,11 @@ export function readRollout(text, { cwd = null } = {}) {
     try { r = JSON.parse(line); } catch (_) { continue; }
     const p = r.payload ?? {};
     const at = Date.parse(r.timestamp) || null;
+    if (r.type === "turn_context") {
+      ctx = { model: typeof p.model === "string" ? p.model : null, effort: typeof p.effort === "string" ? p.effort : null };
+      if (round && round.model == null) Object.assign(round, ctx);
+      continue;
+    }
     if (r.type === "event_msg") {
       if (!round) continue;
       if (p.type === "token_count") {
@@ -328,7 +336,7 @@ export function readRollout(text, { cwd = null } = {}) {
       // A resumed session's files can repeat earlier turns.
       if (!asked || seen.has(`${at}\u0000${asked}`)) continue;
       seen.add(`${at}\u0000${asked}`);
-      round = { at, request: asked, answer: null, final: false, notes: [], calls: [], items: [], logged: false, tokens: 0, cached: 0, end: at };
+      round = { at, request: asked, answer: null, final: false, notes: [], calls: [], items: [], logged: false, tokens: 0, cached: 0, end: at, ...ctx };
       out.rounds.push(round);
       continue;
     }
@@ -362,7 +370,8 @@ export function readRollout(text, { cwd = null } = {}) {
 function finish(r, did) {
   const work = [...r.notes, ...did].sort(byTime);
   return { at: r.at, end: r.end, request: r.request, answer: r.answer, work, steps: did.length,
-    tokens: r.tokens || null, cached: r.cached || null, ended: r.ended ?? null, done: Boolean(r.done || r.final) };
+    tokens: r.tokens || null, cached: r.cached || null, ended: r.ended ?? null, done: Boolean(r.done || r.final),
+    model: r.model ?? null, effort: r.effort ?? null };
 }
 
 const TOOLS = { Bash: "run", Shell: "run", Read: "read", ReadFile: "read", ReadMediaFile: "read", Write: "edit", WriteFile: "edit", Edit: "edit",
@@ -410,6 +419,12 @@ export function readWire(text, { cwd = null } = {}) {
       continue;
     }
     if (!round || round.done) continue;
+    if (r.type === "llm.request") {
+      // What it asks its model with: the model, and the thinking effort it runs at.
+      if (round.model == null && typeof r.model === "string") round.model = r.model;
+      if (round.effort == null && typeof r.thinkingEffort === "string") round.effort = r.thinkingEffort;
+      continue;
+    }
     if (at != null) round.end = at;
     if (r.type === "turn.ended") {
       // The last step's text is the answer.
@@ -493,7 +508,7 @@ if [ -n "$f" ]; then part "$f"; else printf '%s\n' "$all" | while IFS= read -r g
   case "$g" in "") ;; *.zst) zstd -dcq "$g" 2>/dev/null;; *) cat "$g";; esac
 done; fi |
 awk -v a="$2" -v b="$3" '{ t = substr($0, 15, 24); if (t >= a && t <= b) print }' |
-grep -E '^\{"timestamp":"[^"]*",("ordinal":[0-9]+,)?"type":"(response_item","payload":\{"type":"(message|reasoning|function_call|custom_tool_call|local_shell_call|web_search_call)"|event_msg","payload":\{"type":"(token_count|item_completed|task_complete|turn_complete|turn_aborted)")' |
+grep -E '^\{"timestamp":"[^"]*",("ordinal":[0-9]+,)?"type":"(response_item","payload":\{"type":"(message|reasoning|function_call|custom_tool_call|local_shell_call|web_search_call)"|event_msg","payload":\{"type":"(token_count|item_completed|task_complete|turn_complete|turn_aborted)"|turn_context")' |
 grep -v -E '"payload":\{"type":"(message"(,"id":"[^"]*")?,"role":"developer"|reasoning"(,"id":"[^"]*")?,"summary":\[\])|"item":\{"type":"(Reasoning|UserMessage|AgentMessage)"' |
 sed -E 's/"encrypted_content":"[^"]*"/"encrypted_content":null/g; s/"(aggregated_output|last_agent_message)":"(\\.|[^"\\])*"/"\1":""/g; /"item":\{"type":"(FileChange|McpToolCall|Extension)"/ s/"(content|unified_diff|snippet|text|stdout)":"(\\.|[^"\\])*"/"\1":""/g' |
 head -c $4`;
@@ -510,15 +525,16 @@ find "$root" -mindepth 5 -maxdepth 5 -path "*/agents/main/wire.jsonl" -newermt "
 done`;
 
 // A session's lines between two times ($2, $3: ms), of the kinds read here; $5 and $6
-// as for codex.
+// as for codex. Of its model requests, the first of each turn: its model and effort.
 const KIMI_LOG = KIMI_ROOT + PART + String.raw`f=$5; off=$6; size=0
 [ "$f" != - ] || f=$(find "$root" -mindepth 5 -maxdepth 5 -path "*/$1/agents/main/wire.jsonl" 2>/dev/null | head -n 1)
 [ -n "$f" ] || exit 3
 whole "$f"
 printf 'O\t%s\t%s\n' "$f" "$size"
 part "$f" |
-grep -E '^\{"type":"(turn\.prompt|turn\.ended|context\.append_loop_event)"' |
-awk -v a="$2" -v b="$3" '{ if (match($0, /"time":[0-9]+\}$/)) { t = substr($0, RSTART + 7, RLENGTH - 8) + 0; if (t < a || t > b) next } print }' |
+grep -E '^\{"type":"(turn\.prompt|turn\.ended|context\.append_loop_event|llm\.request)"' |
+awk -v a="$2" -v b="$3" '{ if (match($0, /"time":[0-9]+\}$/)) { t = substr($0, RSTART + 7, RLENGTH - 8) + 0; if (t < a || t > b) next }
+  if ($0 ~ /^\{"type":"turn\.prompt"/) asked = 0; else if ($0 ~ /^\{"type":"llm\.request"/) { if (asked) next; asked = 1 } print }' |
 sed -E '/"event":\{"type":"tool\.result"/ s/"output":"(\\.|[^"\\])*"/"output":""/; /"event":\{"type":"tool\.call"/ s/"(content|old_string|new_string)":"(\\.|[^"\\])*"/"\1":""/g' |
 head -c $4`;
 
@@ -776,6 +792,89 @@ export function* requestSteps(k) {
   return rounds[rounds.length - 1]?.request ?? null;
 }
 
+// What a run still going prints, read from its terminal as it prints it. The first look
+// reads all the terminal keeps (up to FULL lines); each later one only its last lines,
+// joined onto what was read before where the two meet. Where they don't (more was printed
+// than a look reads, or the screen was redrawn), all of it is read again.
+const FULL = 5000;
+const TAIL = 150;
+// What is kept of it, at most; past that, the oldest lines go, a few thousand at a time
+// (each time is a new start for what the window shows).
+const KEEP = 20000;
+const DROP = 3000;
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+
+function* terminalLines(address, n) {
+  const r = yield ["hc", ["read", address, "--lines", String(n), "--json"]];
+  if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc read failed").trim().split("\n")[0]);
+  const lines = String(JSON.parse(r.stdout).text ?? "").replace(/\t/g, "    ").replace(CONTROL, "").split("\n");
+  // The screen's rows below its last line of text are only empty.
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines;
+}
+
+/** `fresh`, a terminal's last lines now, joined onto `old`, its lines at the last look:
+ * { lines, from }, `from` the first line that differs from `old` (lines.length: none).
+ * Null where the two don't meet. They meet where `old` has, at least `sure` lines long
+ * (or to its end), the lines `fresh` starts with; of several such places, the one that
+ * makes the least new. */
+export function spliceLines(old, fresh, sure = 24) {
+  if (!old.length || !fresh.length) return null;
+  // As many lines as can be compared: fewer only where `old` or `fresh` is that short.
+  const need = Math.min(sure, fresh.length, old.length);
+  // Blank lines prove nothing: the compared ones must have some text.
+  const solid = (n) => fresh.slice(0, n).filter((l) => l.trim()).length >= Math.min(3, n);
+  for (let s = Math.max(0, old.length - fresh.length); s < old.length; s++) {
+    const n = Math.min(sure, fresh.length, old.length - s);
+    if (n < need) break;
+    let same = true;
+    for (let j = 0; j < n && same; j++) same = old[s + j] === fresh[j];
+    if (!same || !solid(n)) continue;
+    const lines = old.slice(0, s).concat(fresh);
+    let from = s;
+    while (from < lines.length && from < old.length && lines[from] === old[from]) from++;
+    if (from === old.length && lines.length === old.length) from = lines.length;
+    return { lines, from };
+  }
+  return null;
+}
+
+/** The lines a run still going has printed: { lines, from } (see spliceLines). `had`:
+ * the lines of the last look, or null for the first. */
+export function* outputSteps(run, had = null) {
+  if (had?.length) {
+    const joined = spliceLines(had, yield* terminalLines(run.address, TAIL));
+    if (joined && joined.lines.length <= KEEP) return joined;
+    if (joined) return { lines: joined.lines.slice(-(KEEP - DROP)), from: 0 };
+  }
+  const lines = yield* terminalLines(run.address, FULL);
+  return { lines: lines.length > KEEP ? lines.slice(-(KEEP - DROP)) : lines, from: 0 };
+}
+
+/** One line of output as the rows a reader of `cols` columns sees it in: broken at a
+ * space where there is one in its second half, else where it must; the rows after the
+ * first keep its indent (up to a third of the width). A kind for each: `cmd` for a
+ * command shown as `$ ...`, `bad` for an `exit N` that isn't 0, else none. */
+export function wrapLine(line, cols) {
+  const kind = /^\s*\$ /.test(line) ? "cmd" : /^\s*exit [1-9]\d*\s*$/.test(line) ? "bad" : "";
+  cols = Math.max(20, cols);
+  if (line.length <= cols) return [{ t: line, k: kind }];
+  const indent = Math.min(line.match(/^ */)[0].length, Math.floor(cols / 3));
+  const pad = " ".repeat(indent);
+  const rows = [];
+  let rest = line;
+  let room = cols;
+  while (rest.length > room) {
+    let cut = rest.lastIndexOf(" ", room);
+    if (cut < room / 2 || !rest.slice(0, cut).trim()) cut = room;
+    rows.push({ t: (rows.length ? pad : "") + rest.slice(0, cut).replace(/\s+$/, ""), k: kind });
+    rest = rest.slice(cut).replace(/^ +/, "");
+    room = cols - indent;
+  }
+  rows.push({ t: (rows.length ? pad : "") + rest, k: kind });
+  return rows;
+}
+
 // One run that can't be read costs its own round's details, never the others'.
 const unread = (run, e) => [{ ...NOTHING, run, at: run.created_ms ?? null, end: run.finished_ms ?? null, request: null, answer: null,
   transcript: null, cut: false, session: null, live: false, note: `This run couldn't be read: ${why(e)}` }];
@@ -792,3 +891,6 @@ export const liveRounds = (run, had = null) => drive(liveSteps(run, had))
 
 /** What a running one was asked, or null while that isn't known. */
 export const liveRequest = (run) => drive(requestSteps(run)).catch(() => null);
+
+/** What a running one has printed: { lines, from }. Rejects when its terminal can't be read. */
+export const liveOutput = (run, had = null) => drive(outputSteps(run, had));

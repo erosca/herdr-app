@@ -3,17 +3,15 @@
 // their agent in one folded "n finished" row while the core keeps them (a day after
 // their parent saw the result), a follow-up under the same name with its first run;
 // clicking one opens its conversation (conversation.js), dismissing hides it. A
-// sub-agent still working opens as its live terminal: under a bar with the request it
-// was sent when Herdr reads its agent's log (codex, Kimi Code; watch.js), which gives
-// way to its conversation when it ends; any other, or one that needs the person, as
-// the plain peek.
+// sub-agent still working opens the same window, read-only, filled as it goes, when
+// Herdr reads its agent's log (codex, Kimi Code); any other, or one that needs the
+// person, opens as its terminal (peek).
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc } from "herdr";
-import { icon, ending, clock, conversationOf, watchOf } from "./util.js";
+import { icon, ending, clock, conversationOf } from "./util.js";
 import { initConversation, conversationView } from "./conversation.js";
-import { initWatch, watchView } from "./watch.js";
 import { groupThreads, threadOf, belongs, fullRecord, agentOf } from "./thread.js";
 
 function find(node, id) {
@@ -85,7 +83,6 @@ function connectors(t, lines) {
 
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.watch) return initWatch(this, cx);
     if (props()?.thread || props()?.conversation) return initConversation(this, cx);
     if (props()?.sortMenu) return;
     this.folded = new Set();
@@ -415,16 +412,15 @@ export default class Agents extends View {
     run("terminal.peek", { terminal: addr });
   }
 
-  // A running sub-agent: its live terminal, what it prints as it prints it. One whose
-  // agent's log Herdr reads gets it under a bar with the request it was sent, and the
-  // rounds it finished before go along for when it ends. One that waits for the person
-  // opens as the plain peek, the keyboard in its terminal: that is where they answer.
+  // A running sub-agent whose agent's log Herdr reads: its conversation, read-only,
+  // with what it prints as it prints it and the rounds it finished before. Any other, or
+  // one that waits for the person, opens as its terminal: that is where they answer it.
   look(k, status, asker) {
     if (status === "blocked" || !agentOf(k)) return this.peek(k.address);
     const mine = threadOf([k]);
     const earlier = this.done.filter((d) => belongs(mine, d)).sort((x, y) => (x.created_ms ?? 0) - (y.created_ms ?? 0));
-    openOverlay(watchOf({ ...threadOf([...earlier, k]), name: this.nameOf(k), program: this.progOf(k), asker },
-      earlier.map((d) => this.slim(d)), this.slim(k)));
+    openOverlay(conversationOf({ ...threadOf([...earlier, k]), name: this.nameOf(k), program: this.progOf(k), asker },
+      earlier.map((d) => this.slim(d)), [this.slim(k)]));
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
@@ -481,7 +477,6 @@ export default class Agents extends View {
 
   render(cx) {
     const t = theme();
-    if (props()?.watch) return watchView(this, t);
     if (props()?.thread || props()?.conversation) return conversationView(this, t);
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
