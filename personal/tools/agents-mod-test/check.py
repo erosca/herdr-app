@@ -161,6 +161,19 @@ def outputs(folder, cases, answers, i):
         check(ok, "the engine draws \"%s\" with its output: %s" % (cases[i]["name"], what), None if ok else out.strip()[:1200])
 
 
+def sidebar(folder):
+    """The agents list's own rows (main.js): an agent's done count, folded and unfolded, its rows and footer."""
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    for name in ("thread.js", "conversation.js", "util.js", "mod.json"):
+        shutil.copy(os.path.join(MOD, name), folder)
+    shutil.copy(os.path.join(MOD, "main.js"), os.path.join(folder, "agents.js"))
+    shutil.copy(os.path.join(HERE, "sidebar.js"), os.path.join(folder, "main.js"))
+    ok, text = engine(folder)
+    check(ok, "the engine draws the agents list's rows: a done count folded and unfolded, done rows, the footer, short sub-agent names",
+          None if ok else text.strip()[:1200])
+
+
 def slim(step):
     return {k: v for k, v in step.items() if k != "detail" and v is not None}
 
@@ -466,6 +479,7 @@ def main():
             expect(fx, reports, answers)
             print("     (scripts for vm/... ran %s)" % ("through hc exec" if core else "directly: no herdr-core to go through"))
             views(folder, cases, answers, reports, [i for i, c in enumerate(cases) if "thread" in c])
+            sidebar(folder)
             # A round whose turn isn't over: the window draws its output panel.
             outputs(folder, cases, answers, next(i for i, c in enumerate(cases) if c["name"] == "a kimi run still going"))
     print("%d failed" % failed if failed else "all passed")

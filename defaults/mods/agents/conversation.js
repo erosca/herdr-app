@@ -22,7 +22,7 @@ import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
 import { props, closeOverlay, settings, terminals, hc } from "herdr";
 import { finishedRounds, liveRounds, liveOutput, inOrder, belongs, fullRecord, threadOf, requestFromArgv, agentOf } from "./thread.js";
-import { icon, ending, span, clock } from "./util.js";
+import { icon, ending, span, clock, shownName } from "./util.js";
 
 // A request shows this much until it is unfolded.
 const SHOWN_LINES = 8;
@@ -45,7 +45,7 @@ function byAddress(address) {
   const k = all.find((x) => x.address === address);
   if (!k) return { thread: { name: "", addresses: address ? [address] : [] }, runs: [], live: [] };
   const parent = all.find((x) => x.address === k.parent);
-  return { thread: { ...threadOf([k]), name: k.name || k.template || k.program?.name || k.address, program: k.program ?? null,
+  return { thread: { ...threadOf([k]), name: shownName(k) || k.program?.name || k.address, program: k.program ?? null,
     asker: parent?.program?.name || parent?.name || "Parent" }, runs: [], live: [k] };
 }
 

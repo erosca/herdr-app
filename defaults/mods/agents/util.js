@@ -30,6 +30,18 @@ export function clock(ms) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+// A sub-agent's name as a row shows it: its `herdr.title` label (what its parent called
+// the task), else its terminal name, without what relay adds to make it unique
+// (`codex-review-of-terms-a7e8d3` is "review of terms": the icon says codex). Null
+// when it has neither.
+export function shownName(k) {
+  const title = k?.labels?.["herdr.title"];
+  if (title) return title;
+  const name = k?.name || k?.template || null;
+  const relay = name?.match(/^(?:codex|kimi|fake)-(.+)-[0-9a-z]{6}(?:-\d)?$/);
+  return relay ? relay[1].replace(/-/g, " ") : name;
+}
+
 // The window a sub-agent opens as, as openOverlay takes it: as big as a peek.
 const BIG = { kind: "dialog", width: 0.8, height: 0.8 };
 

@@ -155,10 +155,14 @@ the highlighted line shows where it will land.
   records the starter as `parent` (see `terminals()`). They belong to their
   parent's tab without a pane; the `agents` mod shows them,
   `terminal.peek` opens one, `terminal.keep` gives one a pane.
-  `terminals()` lists live terminals only; the `agents` mod gets finished
-  sub-agents from `hc ls --all --json` and shows them in one folded "n finished"
-  row under their agent while the core keeps them; hovering offers dismiss, shared
-  `"agents.finished": false` hides them. Clicking one opens its conversation:
+  `terminals()` lists live terminals only; the `agents` mod shows the running
+  ones under their agent, always, and gets finished ones from `hc ls --all --json`:
+  their agent's row counts them ("18 done", failures in red) while the core keeps
+  them. The count unfolds them, the newest five first (the rest, and Clear all, a
+  click further); clicking the row itself only goes to the agent. Hovering one
+  offers dismiss; shared `"agents.finished": false` hides them. A sub-agent shows
+  as its `herdr.title` label (what its parent called the task), else its name.
+  Clicking a done one opens its conversation:
   each round's request, its work folded into one line ("Worked 3m 12s · 14 steps ·
   41.2k tokens": inside, each step it took, its terminal output a click further)
   and its answer as Markdown; a step cut to one line unfolds on a click. Each
