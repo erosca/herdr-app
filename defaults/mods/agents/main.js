@@ -231,7 +231,6 @@ export default class Agents extends View {
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
-        cx.stop_propagation();
         this.dismiss(addrs);
         this.hovered = null;
         cx.notify();
@@ -256,9 +255,9 @@ export default class Agents extends View {
       .when(open, (el) => el.bg(t.selected))
       .cursor_pointer()
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      // Its press stays its own (the row doesn't go to the agent); its release goes on.
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
-        cx.stop_propagation();
         open ? this.openDone.delete(a.address) : this.openDone.add(a.address);
         cx.notify();
       })
@@ -610,8 +609,8 @@ export default class Agents extends View {
         .text_color(t.dim)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
-          cx.stop_propagation();
           this.setPins(isPinned ? this.pins.filter((p) => p !== a.address) : [...this.pins, a.address]);
           // The row moves away from under the pointer, and no hover-out comes.
           this.hovered = null;

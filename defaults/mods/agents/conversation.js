@@ -481,7 +481,9 @@ function shortened(text) {
   return out.join("\n");
 }
 
-// A link-like button; its click stays its own (a fold it sits in doesn't toggle).
+// A link-like button. Its press stays its own: a fold it sits in doesn't toggle, and no
+// text selection starts. Its release goes on: a text selection ends on it, wherever the
+// mouse is let go (stopped, the selection would go on following the mouse).
 const link = (t, id, label, onClick) => div()
   .id(id)
   .flex_none()
@@ -493,10 +495,8 @@ const link = (t, id, label, onClick) => div()
   .text_color(t.accent)
   .cursor_pointer()
   .hover((s) => s.bg(t.hover))
-  .on_click((e, cx) => {
-    cx.stop_propagation();
-    onClick(e, cx);
-  })
+  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+  .on_click(onClick)
   .child(label);
 
 // The request its parent sent, as its parent wrote it (Markdown), selectable; a long
