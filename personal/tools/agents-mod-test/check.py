@@ -8,6 +8,9 @@
         --together    as one conversation (a first run and its follow-ups)
         --looks 3     a run still going is looked at that many times, each look reading
                       its log on from the last, as the open window does every few seconds
+    personal/tools/agents-mod-test/check.py --splice           how the window reads on what a running
+                      one prints: a terminal printing bursts (in a core of its own) is read
+                      as the window reads it, and each join is compared with a full read
 
 Needs python3 and herdr-app (any build: the mod's files come from this checkout), and
 for --real or --as a running herdr-core. No node.
@@ -55,14 +58,14 @@ def engine(folder):
     return r.returncode == 0, r.stdout + r.stderr
 
 
-def build(folder, cases, answers, mode, view=None, opened=None, watch=None):
+def build(folder, cases, answers, mode, view=None, opened=None, output=None):
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
-    for name in ("thread.js", "conversation.js", "watch.js", "util.js", "mod.json"):
+    for name in ("thread.js", "conversation.js", "util.js", "mod.json"):
         shutil.copy(os.path.join(MOD, name), folder)
     shutil.copy(os.path.join(HERE, "driver.js"), os.path.join(folder, "main.js"))
     with open(os.path.join(folder, "cases.js"), "w") as f:
-        for name, value in (("CASES", cases), ("ANSWERS", answers), ("MODE", mode), ("VIEW", view), ("OPEN", opened), ("WATCH", watch)):
+        for name, value in (("CASES", cases), ("ANSWERS", answers), ("MODE", mode), ("VIEW", view), ("OPEN", opened), ("OUTPUT", output)):
             f.write("export const %s = %s;\n" % (name, json.dumps(value)))
 
 
@@ -147,12 +150,14 @@ def views(folder, cases, answers, reports, which):
             check(ok, "the engine draws \"%s\", %s" % (cases[i]["name"], how), None if ok else text.strip()[:1200])
 
 
-def watches(folder, cases, i):
-    """The bar over a running sub-agent's live terminal: before its request is known, with none, a short one, a long one."""
-    for what, request in (("no request recorded", None), ("a short request", "Check it."), ("a long request", "\n".join("line %d of the brief" % n for n in range(120)))):
-        build(folder, cases, {}, "watch", i, None, request)
-        ok, text = engine(folder)
-        check(ok, "the engine draws the bar over \"%s\"'s live terminal, %s" % (cases[i]["name"], what), None if ok else text.strip()[:1200])
+def outputs(folder, cases, answers, i):
+    """A round still going, drawn with what its run printed: nothing yet, a few lines, a long run of them."""
+    long = "\n".join(("$ cargo test --all-features -- --nocapture" if n % 40 == 0 else "  exit 101" if n % 97 == 0 else
+                      "    " + "word " * (n % 50)) for n in range(3000))
+    for what, text in (("nothing printed yet", None), ("a few lines", "• Reading the plan.\n  It says **three** steps."), ("3,000 lines, long ones wrapped", long)):
+        build(folder, cases, answers, "view", i, 0, text)
+        ok, out = engine(folder)
+        check(ok, "the engine draws \"%s\" with its output: %s" % (cases[i]["name"], what), None if ok else out.strip()[:1200])
 
 
 def slim(step):
@@ -184,6 +189,15 @@ def fixture_cases(fx):
         {"name": "asked: a label", "ask": short("vm/t91")},
         {"name": "asked: on the command line", "ask": short("t90", KIMI)},
         {"name": "asked: through a wrapper", "ask": short("t92", KIMI)},
+        {"name": "splice: more printed", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 10)] + ["b1", "b2"], 3]},
+        {"name": "splice: nothing new", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 10)], 3]},
+        {"name": "splice: the last line rewritten", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 9)] + ["a9 done"], 3]},
+        {"name": "splice: they don't meet", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["x", "y", "z", "w"], 3]},
+        {"name": "splice: blank lines prove nothing", "call": "spliceLines", "args": [["", "", "", "q"], ["", "", "", "r"], 3]},
+        {"name": "wrap: indented prose", "call": "wrapLine", "args": ["    " + "word " * 30, 40]},
+        {"name": "wrap: a command", "call": "wrapLine", "args": ["$ cargo test", 40]},
+        {"name": "wrap: a failure", "call": "wrapLine", "args": ["  exit 101", 40]},
+        {"name": "wrap: no spaces", "call": "wrapLine", "args": ["x" * 90, 40]},
         {"name": "agentOf", "call": "agentOf", "args": [{"argv": [wrapper, "codex", "/w", "/b.md", "/r.md"]}]},
         {"name": "agentOf: a script", "call": "agentOf", "args": [{"argv": ["sh", "-c", "cd w && ~/.kimi-code/bin/kimi -p hi"]}]},
         {"name": "agentOf: what Herdr saw running", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": CODEX}]},
@@ -235,6 +249,11 @@ def expect(fx, reports, answers):
     size = os.path.getsize([os.path.join(d, f) for d, _, fs in os.walk(fx["codex"]) for f in fs if fixtures.SID in f][0])
     check(log and all(len(v["value"]["stdout"]) < 12000 for v in log), "codex: %d of the log's %d bytes cross over: no tool output, instructions or encrypted reasoning"
           % (max(len(v["value"]["stdout"]) for v in log) if log else -1, size))
+
+    check([(x.get("model"), x.get("effort")) for x in rounds("a codex conversation of two runs")] == [("gpt-test", "low"), ("gpt-test", "high")]
+          and [(x.get("model"), x.get("effort")) for x in rounds("a kimi conversation with a round still running")][:2] == [("k-test", "max"), ("k-test", "high")],
+          "each round says the model and effort it ran with: codex's turn settings, kimi's first model request of the turn",
+          [(x.get("model"), x.get("effort")) for x in rounds("a codex conversation of two runs") + rounds("a kimi conversation with a round still running")])
 
     name = "a codex follow-up that names its session"
     (r,) = rounds(name) or [{}]
@@ -335,6 +354,20 @@ def expect(fx, reports, answers):
           "what it said is kept whole, for the window to show as Markdown")
 
     result = lambda name: by[name].get("result")
+    a = ["a%d" % n for n in range(10)]
+    check([result("splice: more printed"), result("splice: nothing new"), result("splice: they don't meet"), result("splice: blank lines prove nothing")] ==
+          [{"lines": a + ["b1", "b2"], "from": 10}, {"lines": a, "from": 10}, None, None],
+          "what a running one prints is read on: new lines joined where the last look ended, nothing new said as such, a gap read again in full",
+          [result("splice: more printed"), result("splice: nothing new")])
+    check(result("splice: the last line rewritten") == {"lines": a[:9] + ["a9 done"], "from": 9}, "a line rewritten in place (a progress line) is taken as it is now",
+          result("splice: the last line rewritten"))
+    rows = result("wrap: indented prose") or []
+    words = " ".join(r["t"].strip() for r in rows).split()
+    check(len(rows) > 1 and all(len(r["t"]) <= 40 for r in rows) and all(r["t"].startswith("    ") for r in rows) and words == ["word"] * 30,
+          "output wraps at spaces to the panel's width, the rows after the first keep the line's indent, no word lost", rows)
+    check(((result("wrap: a command") or [{}])[0].get("k"), (result("wrap: a failure") or [{}])[0].get("k"), [len(r["t"]) for r in result("wrap: no spaces") or []]) ==
+          ("cmd", "bad", [40, 40, 10]), "a command and a failed exit are told apart; a line with no space breaks where it must",
+          [result("wrap: a command"), result("wrap: a failure"), result("wrap: no spaces")])
     check((result("asked: a label"), asked("asked: a label")) == (fixtures.LREQUEST, ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]]),
           "what a running one was asked, for the bar over its terminal: from its label's file, its log not read", asked("asked: a label"))
     check((result("asked: on the command line"), asked("asked: on the command line")) == ("One more: check the docs as well.", ["hc get t90"]),
@@ -364,18 +397,68 @@ def real_cases(addresses, machine, together, looks=1):
             for g in groups]
 
 
+def terminal_lines(text):
+    """A terminal's lines as the mod takes them (thread.js terminalLines)."""
+    lines = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text.replace("\t", "    ")).split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def splice_check(folder):
+    """Reads a terminal that prints in bursts the way the window does, in a core of its own."""
+    state = tempfile.mkdtemp(prefix="splice-core-")
+    env = {**os.environ, "HC_SESSION": "agents-mod-splice-%d" % os.getpid(), "XDG_STATE_HOME": state}
+    env.pop("HC_TERMINAL_ID", None)
+    hc = lambda *args: subprocess.run(["hc", *args], capture_output=True, text=True, env=env, timeout=60)
+    # Bursts of 7, 40, 0, 230 and 600 lines, one every 3 s; long lines and blank ones among them.
+    script = 'n=0; for b in 7 40 0 230 600; do sleep 3; i=0; while [ $i -lt $b ]; do n=$((n+1)); i=$((i+1)); ' \
+             'if [ $((n % 13)) = 0 ]; then echo; elif [ $((n % 17)) = 0 ]; then printf "line %d %0300d\\n" $n 0; else echo "line $n of the probe"; fi; done; done; sleep 60'
+    try:
+        made = hc("run", "--bg", "--json", "--no-parent", "--name", "splice-probe", "--", "bash", "-c", script)
+        address = json.loads(made.stdout)["address"]
+        read = lambda n: terminal_lines(json.loads(hc("read", address, "--lines", str(n), "--json").stdout)["text"])
+        time.sleep(1.5)
+        cases, wanted = [], []
+        old = read(5000)
+        for burst in range(5):
+            time.sleep(3)
+            fresh, now = read(150), read(5000)
+            cases.append({"name": "burst %d" % burst, "call": "spliceLines", "args": [old, fresh]})
+            wanted.append((len(now) - len(old), now, len(old)))
+            old = now
+        build(folder, cases, {}, "report")
+        _, text = engine(folder)
+        found = json.loads(re.search(r"^REPORT (.*)$", text, re.M).group(1))
+        for (added, now, had), got in zip(wanted, found):
+            result = got.get("result")
+            if not had:
+                check(result is None, "nothing read before: all of it is read (%d lines)" % len(now), got)
+            elif result is None:
+                check(added >= 150, "%d lines printed between two looks: they don't meet, so all is read again" % added, got)
+            else:
+                check(result["lines"] == now, "%d lines printed between two looks: the join is exactly what a full read gives (%d lines)" % (added, len(now)),
+                      {"got": len(result["lines"]), "want": len(now)})
+    finally:
+        hc("server", "stop")
+        shutil.rmtree(state, ignore_errors=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--real", nargs="+", metavar="ADDRESS")
     p.add_argument("--as", dest="machine", metavar="MACHINE")
     p.add_argument("--together", action="store_true")
     p.add_argument("--looks", type=int, default=1, metavar="N")
+    p.add_argument("--splice", action="store_true")
     a = p.parse_args()
     if not shutil.which("herdr-app"):
         sys.exit("herdr-app isn't on PATH")
     with tempfile.TemporaryDirectory(prefix="agents-mod-check-") as tmp:
         folder = os.path.join(tmp, "agents-check")
-        if a.real:
+        if a.splice:
+            splice_check(folder)
+        elif a.real:
             cases = real_cases(a.real, a.machine, a.together, a.looks)
             world = {"hc_exec": bool(a.machine)}
             reports, answers = settle(folder, cases, world)
@@ -393,7 +476,8 @@ def main():
             expect(fx, reports, answers)
             print("     (scripts for vm/... ran %s)" % ("through hc exec" if core else "directly: no herdr-core to go through"))
             views(folder, cases, answers, reports, [i for i, c in enumerate(cases) if "thread" in c])
-            watches(folder, cases, next(i for i, c in enumerate(cases) if c.get("live") and not c.get("runs")))
+            # A round whose turn isn't over: the window draws its output panel.
+            outputs(folder, cases, answers, next(i for i, c in enumerate(cases) if c["name"] == "a kimi run still going"))
     print("%d failed" % failed if failed else "all passed")
     sys.exit(1 if failed else 0)
 

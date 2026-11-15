@@ -84,9 +84,17 @@ def codex_session(t0, sid, cwd, turns):
     return lines
 
 
+def context(add, dt, cwd, effort):
+    """The turn's settings, as codex writes them ahead of its request (some 3 kB)."""
+    add(dt, "turn_context", {"turn_id": "turn", "cwd": cwd, "approval_policy": "never", "permission_profile": {"x": "p" * 1200}, "model": "gpt-test",
+                             "collaboration_mode": {"mode": "default", "settings": {"model": "gpt-test", "reasoning_effort": effort}}, "effort": effort,
+                             "summary": "none", "file_system_sandbox_policy": {"x": "s" * 1100}})
+
+
 def first_turn(cwd):
     def turn(add, item, user, said, tokens, command, _n):
         add(1, "event_msg", {"type": "task_started", "turn_id": "turn", "started_at": 0})
+        context(add, 1, cwd, "low")
         user(2, "<environment_context>\n  <cwd>%s</cwd>\n</environment_context>" % cwd, ["environments.environment_context"])
         user(2, REQUEST, ["user.text"])
         item(2, {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": REQUEST, "text_elements": []}]})
@@ -110,6 +118,7 @@ def first_turn(cwd):
 
 def second_turn(add, item, user, said, tokens, command, _n):
     add(300, "event_msg", {"type": "task_started", "turn_id": "turn2", "started_at": 0})
+    context(add, 300, "/w", "high")
     user(301, "Thanks. Now check the tests too.", ["user.text"])
     command(320, "rg -n parse tests", [{"type": "search", "cmd": "rg -n parse tests", "query": "parse", "path": "tests"}])
     tokens(358, 500, 41000, 90)
@@ -182,8 +191,8 @@ def kimi_session(t0, cwd):
     """wire.jsonl, protocol 1.5: {type, ..., time: ms} a line."""
     lines = [compact({"type": "metadata", "protocol_version": "1.5", "created_at": int(t0 * 1000)})]
 
-    def add(dt, kind, **rest):
-        lines.append(compact({"type": kind, **rest, "time": int((t0 + dt) * 1000)}))
+    def add(dt, type_, **rest):
+        lines.append(compact({"type": type_, **rest, "time": int((t0 + dt) * 1000)}))
 
     def loop(dt, **event):
         add(dt, "context.append_loop_event", agentId="main", event=event)
@@ -201,6 +210,10 @@ def kimi_session(t0, cwd):
     lines.append(compact({"message": {"message": {"role": "user", "content": [{"type": "text", "text": BIG}]}}, "type": "agent.message.appended", "time": int(t0 * 1000), "kind": "event"}))
     add(2, "turn.prompt", agentId="main", input=[{"type": "text", "text": KREQUEST}], origin={"kind": "user"}, promptId="msg_1", turnId=0)
     add(2, "context.append_message", agentId="main", message={"role": "user", "content": [{"type": "text", "text": KREQUEST}]})
+    ask = lambda dt, effort: add(dt, "llm.request", agentId="main", kind="loop", provider="openai", model="k-test", modelAlias="kimi-code/k-test",
+                                 thinkingEffort=effort, thinkingKeep="all", toolSelect=False, systemPromptHash="h" * 64, toolsHash="h" * 64, messageCount=3, turnStep="0.1")
+    ask(3, "max")
+    ask(8, "low")
     loop(3, type="step.begin", uuid="s1", turnId="0", step=1)
     loop(4, type="content.part", uuid="p1", turnId="0", step=1, part={"type": "think", "think": "The user wants a review of staging. Let me read the plan first.\nThen the code.", "reasoningKey": "reasoning_content"})
     loop(4, type="content.part", uuid="p2", turnId="0", step=1, part={"type": "text", "text": "I'll read the plan first."})
@@ -226,6 +239,7 @@ def kimi_session(t0, cwd):
     add(82, "prompt.completed", agentId="main", promptId="msg_1", reason="completed")
     # A follow-up, with `kimi -S <session>`.
     add(300, "turn.prompt", agentId="main", input=[{"type": "text", "text": "And level 3?"}], origin={"kind": "user"}, promptId="msg_2", turnId=1)
+    ask(300, "high")
     loop(301, type="step.begin", uuid="s4", turnId="1", step=1)
     loop(320, type="content.part", uuid="p5", turnId="1", step=1, part={"type": "text", "text": "Level 3 is fine."})
     loop(321, type="step.end", uuid="s4", turnId="1", step=1, finishReason="end_turn", usage=usage(50, 20, 12000))

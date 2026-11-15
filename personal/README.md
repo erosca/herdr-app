@@ -106,6 +106,7 @@ with `--real <address>...` on runs of this machine's herdr-core. It needs
 personal/tools/agents-mod-test/check.py                       # the fixture cases
 personal/tools/agents-mod-test/check.py --real t1g t1h --as vm   # real runs, as seen from another computer
 personal/tools/agents-mod-test/check.py --real t6m --as vm --looks 3   # one still going, read on twice
+personal/tools/agents-mod-test/check.py --splice              # reading on what a running one prints, on a real terminal
 ```
 
 ## Dummy agent

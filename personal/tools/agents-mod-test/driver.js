@@ -6,16 +6,14 @@
 //     to run and ask again;
 //   - MODE "report" throws what each case came to, for check.py to compare;
 //   - MODE "view" renders one case's conversation window for real: a wrong element
-//     method or argument fails the check;
-//   - MODE "watch" renders the bar over a running sub-agent's live terminal, with the
-//     request WATCH (null: none was recorded).
+//     method or argument fails the check. A round still going shows OUTPUT as what its
+//     run printed (null: nothing yet).
 
 import { View } from "gpui-kit";
 import { theme } from "herdr";
 import * as thread from "./thread.js";
-import { initConversation, conversationView } from "./conversation.js";
-import { initWatch, watchView } from "./watch.js";
-import { CASES, ANSWERS, MODE, VIEW, OPEN, WATCH } from "./cases.js";
+import { initConversation, conversationView, setOutput } from "./conversation.js";
+import { CASES, ANSWERS, MODE, VIEW, OPEN, OUTPUT } from "./cases.js";
 
 const NEED = {};
 
@@ -91,14 +89,11 @@ export default class Driver extends View {
   init(_props, cx) {
     this.needs = [];
     this.done = CASES.map((c) => run(c, this.needs));
-    if (MODE === "watch") {
-      const c = CASES[VIEW];
-      return initWatch(this, cx, { watch: { thread: c.thread, runs: c.runs ?? [], live: (c.live ?? c.runs)[0] }, request: WATCH, overlay: "check" });
-    }
     if (MODE !== "view" || this.needs.length) return;
     const c = CASES[VIEW];
     const rounds = this.done[VIEW].rounds;
     initConversation(this, cx, { thread: c.thread, runs: c.runs ?? [], live: c.live ?? [], rounds, overlay: "check" });
+    if (OUTPUT != null) for (const r of rounds) if (r.live) setOutput(this, r.run.address, OUTPUT);
     if (OPEN == null) return;
     // One round open with everything in it unfolded: its whole request, its steps (each
     // to its whole text), its terminal output.
@@ -112,7 +107,6 @@ export default class Driver extends View {
   }
 
   render() {
-    if (MODE === "watch") return watchView(this, theme());
     if (this.needs.length) throw new Error(`NEED ${JSON.stringify(this.needs)}`);
     if (MODE === "report") throw new Error(`REPORT ${JSON.stringify(this.done.map((d) => d.report ?? { name: d.name, result: d.result }))}`);
     return conversationView(this, theme());
