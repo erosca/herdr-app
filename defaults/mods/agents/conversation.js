@@ -59,7 +59,7 @@ const waiting = (k) => ({ run: k, live: true, done: false, pending: true, at: k.
 // its scroll bar under way; the wheel's part of a line not scrolled yet; how many lines
 // the panel takes at most (`fit`, from its last frame: scrolling stops where the first
 // line is in view).
-const output = () => ({ lines: [], at: 0, follow: true, back: 0, drag: false, wheel: 0, fit: 1, reading: false, error: null, copied: 0 });
+const output = () => ({ lines: [], at: 0, follow: true, back: 0, drag: false, wheel: 0, fit: 1, reading: false, error: null });
 
 // `given`: the window's props; tests pass their own, with `rounds` already read.
 export function initConversation(v, cx, given = props()) {
@@ -499,8 +499,21 @@ const link = (t, id, label, onClick) => div()
   .on_click(onClick)
   .child(label);
 
-// The request its parent sent, as its parent wrote it (Markdown), selectable; a long
-// one folded to its first lines.
+// A link that copies what `text()` gives: the request and the answer as their writer wrote
+// them (Markdown), the output as printed. It says "Copied" for two seconds.
+function copyLink(v, t, id, label, text) {
+  const copied = Date.now() - (v.copied?.get(id) ?? 0) < 2000;
+  return link(t, id, copied ? "Copied" : label, (_e, cx) => {
+    cx.write_to_clipboard(text());
+    v.copied = v.copied ?? new Map();
+    v.copied.set(id, Date.now());
+    cx.timer.after(2100, (cx) => cx.notify());
+    cx.notify();
+  });
+}
+
+// The request its parent sent, as its parent wrote it (Markdown), selectable, and a link
+// that copies its Markdown; a long one folded to its first lines.
 function requestView(v, t, r) {
   const th = v.thread;
   const text = (r.request ?? "").replace(/\s+$/, "");
@@ -515,7 +528,11 @@ function requestView(v, t, r) {
     .bg(t.raised)
     .border_l(2)
     .border_color(t.accent)
-    .child(div().text_size(11).text_color(t.dim).child(`${th.asker || "Parent"} → ${th.name ?? ""}`))
+    .child(h_flex()
+      .gap(8)
+      .items_center()
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(`${th.asker || "Parent"} → ${th.name ?? ""}`))
+      .when(Boolean(text), (el) => el.child(copyLink(v, t, `copy-request-${r.key}`, "Copy request", () => text))))
     .when(!text, (el) => el.child(div().text_size(12.5).text_color(t.dim).child(r.pending ? "Reading its request…" : "The request wasn't recorded.")))
     .when(Boolean(text), (el) => el.child(div().text_size(12.5).text_color(t.foreground)
       .child(TextView.markdown(`request-${r.key}`, short && !all ? short : text).selectable(true))))
@@ -541,7 +558,6 @@ function statusViews(v, t, r) {
   const o = v.out.get(r.run.address);
   const now = r.work?.[r.work.length - 1];
   const quiet = Date.now() - Math.max(o?.at ?? 0, r.seen ?? 0, r.at ?? 0);
-  const copied = o && Date.now() - o.copied < 2000;
   const out = [h_flex()
     .gap(8)
     .items_center()
@@ -551,11 +567,7 @@ function statusViews(v, t, r) {
     .child(div().flex_none().child(facts(r, r.at != null ? `Working ${span(Date.now() - r.at)}` : "Working")))
     .when(quiet >= 60000, (el) => el.child(div().flex_none().child(`· nothing new for ${span(quiet)}`)))
     .child(div().flex_1())
-    .when(Boolean(o?.lines.length), (el) => el.child(link(t, `copy-${r.key}`, copied ? "Copied" : "Copy output", (_e, cx) => {
-      cx.write_to_clipboard(o.lines.join("\n"));
-      o.copied = Date.now();
-      cx.notify();
-    })))];
+    .when(Boolean(o?.lines.length), (el) => el.child(copyLink(v, t, `copy-${r.key}`, "Copy output", () => o.lines.join("\n"))))];
   if (now) {
     const say = now.kind === "say";
     out.push(h_flex()
@@ -776,7 +788,6 @@ function answerViews(v, t, r, i, took) {
   }
   const out = [];
   const shown = v.work.has(r.key);
-  const copied = Date.now() - (v.copied?.get(r.key) ?? 0) < 2000;
   out.push(h_flex()
     .id(`work-${r.key}`)
     .gap(6)
@@ -792,14 +803,7 @@ function answerViews(v, t, r, i, took) {
       })
       .child(svg(`mods/workspace-chrome/chevron-${shown ? "down" : "right"}.svg`).size(10).flex_none()))
     .child(div().flex_1().min_w(0).child(facts(r, took ? `Worked ${took}` : "Work", shown)))
-    .child(link(t, `copy-answer-${r.key}`, copied ? "Copied" : "Copy answer", (_e, cx) => {
-      cx.write_to_clipboard(r.answer);
-      v.copied = v.copied ?? new Map();
-      v.copied.set(r.key, Date.now());
-      // "Copied" goes back to "Copy answer" a moment later.
-      cx.timer.after(2100, (cx) => cx.notify());
-      cx.notify();
-    })));
+    .child(copyLink(v, t, `copy-answer-${r.key}`, "Copy answer", () => r.answer)));
   if (shown && (steps || v.editors.has(r.key))) out.push(steps ? stepsView(v, t, r, i) : transcriptView(v, t, r, i));
   out.push(div().text_size(13).text_color(t.foreground).child(TextView.markdown(`answer-${r.key}`, r.answer).selectable(true)));
   return out;

@@ -168,7 +168,8 @@ the highlighted line shows where it will land.
   41.2k tokens": inside, each step it took, its terminal output a click further)
   and its answer as Markdown; a step cut to one line unfolds on a click. Each
   round names the model and effort it ran with, and its request is a quoted block
-  of selectable Markdown, its first lines shown until Show all. A codex or Kimi
+  of selectable Markdown, its first lines shown until Show all. Copy request and
+  Copy answer copy them as Markdown, Copy output what a working one printed. A codex or Kimi
   Code sub-agent still working opens the same window: its request, how long and
   how far it is (from its log), what it is doing now, and what it prints as it
   prints it, read from its terminal every second as selectable text that follows
