@@ -482,11 +482,14 @@ export default class Agents extends View {
     });
   }
 
-  subRow(t, s, shown, compact, asker) {
+  // A running sub-agent: how long it has been in its state (working, waiting for you,
+  // idle), as an agent's row says, next to the state.
+  subRow(t, s, shown, compact, asker, now) {
     const k = s.t;
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
     const on = k.address === shown;
+    const when = this.kidAt?.[k.address]?.at;
     return h_flex()
       .id(`sub-${k.address}`)
       .pl(39)
@@ -503,6 +506,7 @@ export default class Agents extends View {
       .children(connectors(t, s.lines))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(this.nameOf(k)))
+      .when(Boolean(when), (el) => el.child(div().flex_none().ml(6).mr(8).text_size(11).text_color(t.dim).child(duration(now - when))))
       .child(this.status(t, { status: st }, compact));
   }
 
@@ -553,7 +557,7 @@ export default class Agents extends View {
       const r = row(a, i, done, open);
       // Who asked, as the conversation's request blocks say it: the agent, or a sub-agent.
       const askers = new Map([[a.address, a.program?.name || "Parent"], ...subs.map((s) => [s.t.address, this.nameOf(s.t)])]);
-      const rows = [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority, askers.get(s.t.parent) ?? "Parent"))];
+      const rows = [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority, askers.get(s.t.parent) ?? "Parent", now))];
       if (open) {
         const every = this.allDone.has(a.address);
         const listed = every ? done : done.slice(0, DONE_SHOWN);

@@ -1,6 +1,7 @@
 // What check.py runs to draw the agents list's own rows (main.js) in Herdr's engine:
-// an agent's row pieces with made-up sub-agents, done ones folded and unfolded. The
-// engine reports only a thrown error, so a wrong element method or argument fails it.
+// an agent's row pieces with made-up sub-agents (a running one with and without its time),
+// done ones folded and unfolded. The engine reports only a thrown error, so a wrong element
+// method or argument fails it.
 
 import { View } from "gpui-kit";
 import { v_flex } from "gpui-base";
@@ -31,7 +32,9 @@ export default class Sidebar extends View {
     return v_flex().children([
       a.doneBadge(t, agent, threads, false),
       a.doneBadge(t, agent, threads, true),
-      a.subRow(t, live, null, false, "Claude Code"),
+      a.subRow(t, live, null, false, "Claude Code", now),
+      // Working for 12 minutes: the time beside the spinner.
+      (a.kidAt[live.t.address] = { s: "working", at: now - 720000 }, a.subRow(t, live, null, false, "Claude Code", now)),
       ...threads.slice(0, 5).map((th, j) => a.doneRow(t, th, ["├"], now, "Claude Code", j === 1)),
       a.doneFooter(t, agent, threads, false),
       a.doneFooter(t, agent, threads, true),

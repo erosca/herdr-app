@@ -156,7 +156,8 @@ the highlighted line shows where it will land.
   parent's tab without a pane; the `agents` mod shows them,
   `terminal.peek` opens one, `terminal.keep` gives one a pane.
   `terminals()` lists live terminals only; the `agents` mod shows the running
-  ones under their agent, always, and gets finished ones from `hc ls --all --json`:
+  ones under their agent, always, each with how long it has been in its state
+  (working 12m), and gets finished ones from `hc ls --all --json`:
   their agent's row counts them ("18 done", failures in red) while the core keeps
   them. The count unfolds them, the newest five first (the rest, and Clear all, a
   click further); clicking the row itself only goes to the agent. Hovering one
