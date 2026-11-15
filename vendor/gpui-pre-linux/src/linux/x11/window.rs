@@ -286,6 +286,8 @@ pub struct X11WindowState {
     hovered: bool,
     force_render_after_recovery: bool,
     fullscreen: bool,
+    /// HERDR: whether MapWindow was sent: before it, the window is not the window manager's yet.
+    map_requested: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
@@ -433,6 +435,19 @@ fn set_wm_hints_urgency(xcb: &XCBConnection, x_window: xproto::Window, urgent: b
     )
     .log_err();
     xcb_flush(xcb);
+}
+
+/// HERDR: puts `states` into a window's _NET_WM_STATE before it is mapped. Until then it is
+/// not the window manager's: EWMH has the client set the property itself, which the window
+/// manager reads as it maps the window, and window managers that follow it (mutter, kwin)
+/// drop a _NET_WM_STATE request about a window they don't manage. GPUI asks for a window
+/// opened maximized or full screen before mapping it, so it came up as a plain window there.
+fn set_initial_state(xcb: &XCBConnection, x_window: xproto::Window, atoms: &XcbAtoms, states: &[u32]) {
+    check_reply(
+        || "X11 ChangeProperty32 setting the initial _NET_WM_STATE failed.",
+        xcb.change_property32(xproto::PropMode::APPEND, x_window, atoms._NET_WM_STATE, xproto::AtomEnum::ATOM, states),
+    )
+    .log_err();
 }
 
 /// Convert X11 connection errors to `anyhow::Error` and panic for unrecoverable errors.
@@ -845,6 +860,7 @@ impl X11WindowState {
                 hovered: false,
                 force_render_after_recovery: false,
                 fullscreen: false,
+                map_requested: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
@@ -1615,6 +1631,7 @@ impl PlatformWindow for X11Window {
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {
+        self.0.state.borrow_mut().map_requested = true;
         check_reply(
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
@@ -1673,6 +1690,14 @@ impl PlatformWindow for X11Window {
 
     fn zoom(&self) {
         let state = self.0.state.borrow();
+        // HERDR: a window opened maximized asks before it is mapped.
+        if !state.map_requested {
+            set_initial_state(&self.0.xcb, self.0.x_window, &state.atoms, &[
+                state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+                state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+            ]);
+            return;
+        }
         self.set_wm_hints(
             || "X11 SendEvent to maximize a window failed.",
             WmHintPropertyState::Toggle,
@@ -1684,6 +1709,11 @@ impl PlatformWindow for X11Window {
 
     fn toggle_fullscreen(&self) {
         let state = self.0.state.borrow();
+        // HERDR: a window opened full screen asks before it is mapped.
+        if !state.map_requested {
+            set_initial_state(&self.0.xcb, self.0.x_window, &state.atoms, &[state.atoms._NET_WM_STATE_FULLSCREEN]);
+            return;
+        }
         self.set_wm_hints(
             || "X11 SendEvent to fullscreen a window failed.",
             WmHintPropertyState::Toggle,
