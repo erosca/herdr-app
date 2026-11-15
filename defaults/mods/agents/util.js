@@ -42,8 +42,12 @@ export function shownName(k) {
   return relay ? relay[1].replace(/-/g, " ") : name;
 }
 
-// The window a sub-agent opens as, as openOverlay takes it: as big as a peek.
-const BIG = { kind: "dialog", width: 0.8, height: 0.8 };
+// The window a sub-agent opens as, as openOverlay takes it: most of Herdr's window, as a
+// peek, but no wider than it is on a full-HD screen. What makes it readable is how many
+// characters a line holds, and at the same zoom a pixel holds the same text on any screen:
+// wider than this, on a QHD or 4K screen, a line of its answer runs to 250 characters and
+// more. (Herdr's zoom scales the width with the text.)
+const BIG = { kind: "dialog", width: 0.8, height: 0.8, max_width: 1536 };
 
 /** Its conversation: each round's request, work and answer. `find`: the conversation's
  * finished runs are asked of the core first (the opener's list may lack the newest). */
