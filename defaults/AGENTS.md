@@ -1115,7 +1115,8 @@ All of it is in `herdr.d.ts`. In short:
 - Floating: `placement()` (null unless this copy floats).
 - Act: `run(command, args)`.
 - Overlays: `openOverlay({ mod, props, kind: "dialog" | "popup" | "window", width, height, at, frame })`
-  returns an id; the mod gets `props().overlay` and closes itself with
+  returns an id (`width`/`height`: px, or up to 1 a share of the window; `max_width`/
+  `max_height`, px, cap that share on a big screen); the mod gets `props().overlay` and closes itself with
   `closeOverlay(id)`; Esc closes the top dialog or popup. `frame: "none"`
   drops Herdr's border, corners and shadow so the mod draws its own.
   `notify({ title, body, level, icon, timeout })` posts a notification, drawn

@@ -348,6 +348,10 @@ struct Overlay {
     at: Point<Pixels>,
     /// As designed; drawn at the current zoom. Up to 1: a share of the window.
     size: Size<f32>,
+    /// `max_width` / `max_height`: the most it takes, in px as designed, whatever share of
+    /// the window `size` asks for (a reading width on a wide screen).
+    max_width: Option<f32>,
+    max_height: Option<f32>,
     expires: Option<Instant>,
     focus: FocusHandle,
     /// Blocks instead of one mod (terminals too), ids prefixed with the overlay's.
@@ -3915,12 +3919,15 @@ impl AppWindow {
         }
         let first_term = layout.as_ref().and_then(|l| l.visible_blocks().into_iter().find(|n| matches!(n.content(), Some(Content::Terminal { .. }))).map(|n| n.id.clone()));
         let has_layout = layout.is_some();
+        let most = |k: &str| spec.get(k).and_then(Value::as_f64).filter(|v| *v > 0.0).map(|v| v as f32);
         self.overlays.push(Overlay {
             id,
             kind,
             slot,
             at,
             size,
+            max_width: most("max_width"),
+            max_height: most("max_height"),
             expires: (kind == OverlayKind::Toast).then(|| Instant::now() + Duration::from_millis(timeout as u64)),
             focus,
             layout,
@@ -4744,6 +4751,9 @@ impl AppWindow {
             // Up to 1: a share of the window (terminals in overlays want room, not px).
             let span = |v: f32, full: Pixels| if v <= 1.0 { full * v } else { settings::z(v) };
             let (w, h) = (span(o.size.width, viewport.width), span(o.size.height, viewport.height));
+            // A share of a big window stops at its max_width / max_height.
+            let most = |v: Pixels, max: Option<f32>| max.map(settings::z).filter(|m| *m < v).unwrap_or(v);
+            let (w, h) = (most(w, o.max_width), most(h, o.max_height));
             let sized = |v: f32| v > 0.0 || o.kind != OverlayKind::Window;
             let content = match &o.layout {
                 Some(l) => self.render_node(l, &HashSet::new(), None, cx),
