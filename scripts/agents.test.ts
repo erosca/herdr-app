@@ -1,8 +1,10 @@
 import { test, expect } from "bun:test";
 import { readFile } from "node:fs/promises";
 
-const source = (await readFile(new URL("../defaults/mods/agents/main.js", import.meta.url), "utf8"))
-  .replace(/^import .*;\n/gm, "").replace("export default class Agents", "class Agents");
+// The mod and the modules it imports, in one scope: their imports and exports dropped.
+const modules = await Promise.all(["util.js", "thread.js", "conversation.js", "main.js"]
+  .map((file) => readFile(new URL(`../defaults/mods/agents/${file}`, import.meta.url), "utf8")));
+const source = modules.join("\n").replace(/^import .*;\n/gm, "").replace(/^export (default )?/gm, "");
 
 function harness(pins: string[], globals: Record<string, unknown> = {}) {
   const data = new Map([["pins", JSON.stringify(pins)]]);
