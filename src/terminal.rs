@@ -978,7 +978,7 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     let text = match k.key.as_str() {
         "space" => Some(" ".to_owned()),
-        _ => k.key_char.clone(),
+        _ => k.key_char.clone().or_else(|| ctrl_text(k)),
     };
     // macOS translates Option into text unless it is configured as Alt.
     // That text can be ASCII too (Slovenian Shift-Option-2 -> "@").
@@ -993,7 +993,32 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     if m.alt && !option_as_alt && text.as_deref().is_some_and(|t| !t.is_empty() && (cfg!(target_os = "macos") || !t.is_ascii())) {
         consumed |= GHOSTTY_MODS_ALT as GhosttyMods;
     }
-    Some(vt.encode_key(key, mods, consumed, text.as_deref(), unshifted))
+    let bytes = vt.encode_key(key, mods, consumed, text.as_deref(), unshifted);
+    // The text from ctrl_text is for modifyOtherKeys alone: elsewhere libghostty sends
+    // Ctrl+punctuation with text (Ctrl+; Ctrl+=) as CSI u, which a shell prints. Without
+    // the text it sends what it always did.
+    if k.key_char.is_none() && k.key != "space" && text.is_some() && !bytes.starts_with(b"\x1b[27;") {
+        return Some(vt.encode_key(key, mods, consumed, None, unshifted));
+    }
+    Some(bytes)
+}
+
+/// The character under Ctrl, which libghostty wants as the key's text ("n" for
+/// Ctrl+N; it encodes Ctrl itself), as Ghostty gives it. GPUI drops the text when
+/// Ctrl turns it into a control code. Without it, in xterm's modifyOtherKeys
+/// (vim asks for it), Ctrl+letters went as bare control codes while other
+/// modified keys went as sequences. Once vim has seen a sequence it only matches
+/// mappings in that form, so `<C-N><C-N>` stopped working after a while. Only a
+/// CSI 27 sequence keeps the text (`key_bytes`): outside that mode the bytes are what
+/// they were. Shift, Alt and Cmd combinations are left as they were.
+fn ctrl_text(k: &Keystroke) -> Option<String> {
+    let mut chars = k.key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if k.modifiers.control && !k.modifiers.shift && !k.modifiers.alt && !k.modifiers.platform && c.is_ascii_graphic() => {
+            Some(c.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn map_key(key: &str) -> Option<(GhosttyKey, bool, Option<char>)> {
@@ -1950,6 +1975,41 @@ mod tests {
                 assert_eq!(key_bytes(&mut vt, &press(key, Some(text))).unwrap(), text.as_bytes(), "{key}, mode={setup:?}");
             }
             assert_eq!(key_bytes(&mut vt, &press("alt-left", None)).unwrap(), b"\x1b[1;3D");
+        }
+    }
+
+    /// vim asks for xterm's modifyOtherKeys (TERM=xterm-*). Once it has seen a key
+    /// as a CSI 27 sequence (Shift+Enter is one in any mode), it matches mappings
+    /// only in that form: `<C-N><C-N>` broke while Ctrl+N still came as a control
+    /// code. In that mode every modified key is a sequence, as in xterm and Ghostty.
+    #[test]
+    fn ctrl_keys_come_as_sequences_where_the_program_asked_for_modify_other_keys() {
+        let mut vt = Vt::new(20, 3);
+        let send = |vt: &mut Vt, spec| key_bytes(vt, &press(spec, None)).unwrap();
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x0e", "a shell: the control code");
+        vt.write(b"\x1b[>4;2m");
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x1b[27;5;110~");
+        assert_eq!(send(&mut vt, "shift-enter"), b"\x1b[27;2;13~");
+        vt.write(b"\x1b[>4m");
+        assert_eq!(send(&mut vt, "ctrl-n"), b"\x0e", "vim gone: the control code again");
+    }
+
+    /// The key's text is for modifyOtherKeys only: in a shell no Ctrl+key comes as CSI u
+    /// (a shell prints it), and where vim asked for the mode each comes as CSI 27.
+    #[test]
+    fn ctrl_text_reaches_only_programs_that_asked_for_modify_other_keys() {
+        let keys = "abcdefghijklmnopqrstuvwxyz0123456789[]\\/-=;',.`";
+        let mut vt = Vt::new(20, 3);
+        for c in keys.chars() {
+            let spec = format!("ctrl-{c}");
+            let bytes = key_bytes(&mut vt, &press(&spec, None)).unwrap_or_default();
+            assert!(!(bytes.starts_with(b"\x1b[") && bytes.ends_with(b"u")), "{spec} in a shell: {:?}", String::from_utf8_lossy(&bytes));
+        }
+        vt.write(b"\x1b[>4;2m");
+        for c in keys.chars() {
+            let spec = format!("ctrl-{c}");
+            let bytes = key_bytes(&mut vt, &press(&spec, None)).unwrap_or_default();
+            assert!(bytes.starts_with(b"\x1b[27;5;"), "{spec} where vim asked for modifyOtherKeys: {:?}", String::from_utf8_lossy(&bytes));
         }
     }
 
