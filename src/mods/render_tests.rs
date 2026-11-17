@@ -160,7 +160,11 @@ fn fixture(populated: bool, props: Value, update: Value) -> BTreeMap<String, Val
         ("window".into(), json!({"platform":"linux","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true})),
         ("placement".into(), Value::Null),
         ("home".into(), json!("/fixture")), ("appHome".into(), json!("/fixture/app")),
-        ("keys".into(), Value::Array(serde_json::from_str::<BTreeMap<String, BTreeMap<String, String>>>(include_str!("../../defaults/keys.json")).unwrap().into_iter().flat_map(|(section, bindings)| bindings.into_iter().map(move |(keys, action)| json!({"section":section,"keys":keys,"action":action}))).collect())),
+        // As keys() lists them: an object binding's action is its JSON text.
+        ("keys".into(), Value::Array(serde_json::from_str::<BTreeMap<String, BTreeMap<String, Value>>>(include_str!("../../defaults/keys.json")).unwrap().into_iter().flat_map(|(section, bindings)| bindings.into_iter().map(move |(keys, action)| {
+            let action = action.as_str().map_or_else(|| action.to_string(), str::to_owned);
+            json!({"section":section,"keys":keys,"action":action})
+        })).collect())),
         ("commands".into(), Value::Array(crate::commands::COMMANDS.iter().map(|c| json!({"name":c.name,"about":c.about,"args":c.args.iter().map(|a| json!({"name":a.name,"required":a.required})).collect::<Vec<_>>()})).collect())),
     ]);
     if populated {
@@ -1178,9 +1182,19 @@ fn shipped_layouts_and_keys() {
         include_str!("../../defaults/keys.macos.json"),
     ] {
         crate::keys::parse(text).unwrap();
-        let sections: BTreeMap<String, BTreeMap<String, String>> = serde_json::from_str(text).unwrap();
+        let sections: BTreeMap<String, BTreeMap<String, Value>> = serde_json::from_str(text).unwrap();
         for bindings in sections.values() {
-            for action in bindings.values() {
+            for binding in bindings.values() {
+                // {"command", "args"}: a command with named arguments.
+                if let Value::Object(object) = binding {
+                    let name = object["command"].as_str().expect("a binding object names its command");
+                    let command = crate::commands::find(name).unwrap_or_else(|| panic!("unknown shipped key command {name}"));
+                    let args = object.get("args").cloned().unwrap_or_else(|| json!({}));
+                    crate::commands::validate_args(command, &args).unwrap();
+                    assert!(crate::commands::missing(command, &args).is_none(), "missing shipped key argument {binding}");
+                    continue;
+                }
+                let action = binding.as_str().expect("a binding is a string or an object");
                 let name = action.split(':').next().unwrap();
                 if let Some(command) = crate::commands::find(name) {
                     let args = match action.split_once(':') {

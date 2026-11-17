@@ -1750,7 +1750,13 @@ impl AppWindow {
             None => self.focused_terminal(window, cx).map(|t| t.view.clone()).ok_or("no focused terminal to scroll")?,
         };
 
-        view.update(cx, |view, cx| view.scroll_history(target, cx));
+        // keys: true (Shift+PageUp/PageDown): a full-screen program gets keys instead.
+        let keys = args.get("keys").and_then(Value::as_bool).unwrap_or(false);
+        view.update(cx, |view, cx| {
+            if !(keys && view.send_scroll_keys(&target)) {
+                view.scroll_history(target, cx);
+            }
+        });
         Ok(())
     }
 
@@ -7532,7 +7538,7 @@ export default class SystemToast extends View {
             assert!(!super::needs_model_pane(name, &json!({})), "{name}");
             assert!(!super::needs_model_pane(name, &json!({"place": "tab"})), "{name}");
         }
-        for name in ["pane.focus", "terminal.copy", "terminal.paste", "terminal.paste_image", "terminal.right_click"] {
+        for name in ["pane.focus", "terminal.copy", "terminal.paste", "terminal.paste_image", "terminal.right_click", "terminal.scroll"] {
             assert!(!super::needs_model_pane(name, &json!({})), "{name}");
         }
     }

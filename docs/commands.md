@@ -347,7 +347,7 @@ No arguments.
 
 ## `terminal.scroll`
 
-Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: "top" (oldest history) or "bottom" (the live screen). This scrolls Herdr's view, not the program.
+Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: "top" (oldest history) or "bottom" (the live screen). This scrolls Herdr's view, not the program. With keys: true, a full-screen program (an editor, a pager), which has no history here, gets PageUp/PageDown for pages and arrow keys for lines instead, as Shift+PageUp/PageDown do.
 
 | Argument | Required |
 |---|---|
@@ -355,6 +355,7 @@ Scroll a terminal's view of its history (default: the focused one). Give exactly
 | `pages` | no |
 | `to` | no |
 | `terminal` | no |
+| `keys` | no |
 
 ## `terminal.paste`
 

@@ -825,6 +825,26 @@ impl TerminalView {
         true
     }
 
+    /// `terminal.scroll {keys: true}` on the alternate screen: a full-screen program has no
+    /// history here, so it gets PageUp/PageDown or arrow keys instead, as the wheel sends it
+    /// arrows: pagers and editors page with them. False (nothing sent) on the main screen,
+    /// where the history scrolls as usual.
+    pub fn send_scroll_keys(&mut self, target: &ScrollTarget) -> bool {
+        let mut g = self.grid.borrow_mut();
+        if !g.vt.alt_screen() {
+            return false;
+        }
+        if let Some((key, n)) = scroll_keys(target) {
+            let mut bytes = Vec::new();
+            for _ in 0..n {
+                bytes.extend(g.vt.encode_key(key, 0, 0, None, None));
+            }
+            drop(g);
+            self.send(&bytes);
+        }
+        true
+    }
+
     /// Copies the selection to the clipboard (and the primary selection on Linux).
     /// Returns whether anything was copied. Does not clear the selection: mouse
     /// copy-on-select uses this and keeps the highlight.
@@ -2771,6 +2791,21 @@ impl Focusable for TerminalView {
     }
 }
 
+/// The keys a full-screen program gets for a scroll, and how many (at most `MAX_SCROLL_KEYS`):
+/// PageUp/PageDown for pages (a part page counts as one), arrows for lines. None for the
+/// edges and for nothing at all.
+fn scroll_keys(target: &ScrollTarget) -> Option<(GhosttyKey, usize)> {
+    const MAX_SCROLL_KEYS: usize = 1_000;
+    let (key, n) = match *target {
+        ScrollTarget::Pages(p) if p < 0.0 => (GHOSTTY_KEY_PAGE_UP, p.abs().ceil()),
+        ScrollTarget::Pages(p) => (GHOSTTY_KEY_PAGE_DOWN, p.ceil()),
+        ScrollTarget::Lines(l) if l < 0 => (GHOSTTY_KEY_ARROW_UP, l.unsigned_abs() as f64),
+        ScrollTarget::Lines(l) => (GHOSTTY_KEY_ARROW_DOWN, l as f64),
+        ScrollTarget::Top | ScrollTarget::Bottom => return None,
+    };
+    (n >= 1.0).then(|| (key, (n as usize).min(MAX_SCROLL_KEYS)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target, scroll_state_changed};
@@ -3590,6 +3625,20 @@ mod tests {
         cx.run_until_parked();
         root.read_with(cx, |root, cx| assert!(root.0.read(cx).search_open));
         assert!(cx.debug_bounds("find-bar").is_some());
+    }
+
+    #[test]
+    fn a_full_screen_program_gets_page_and_arrow_keys_for_a_scroll() {
+        use super::{ScrollTarget, scroll_keys};
+        use ghostty_sys::*;
+        assert_eq!(scroll_keys(&ScrollTarget::Pages(-1.0)), Some((GHOSTTY_KEY_PAGE_UP, 1)));
+        assert_eq!(scroll_keys(&ScrollTarget::Pages(2.0)), Some((GHOSTTY_KEY_PAGE_DOWN, 2)));
+        assert_eq!(scroll_keys(&ScrollTarget::Pages(0.5)), Some((GHOSTTY_KEY_PAGE_DOWN, 1)), "a part page is a page");
+        assert_eq!(scroll_keys(&ScrollTarget::Lines(-3)), Some((GHOSTTY_KEY_ARROW_UP, 3)));
+        assert_eq!(scroll_keys(&ScrollTarget::Lines(99_999_999)), Some((GHOSTTY_KEY_ARROW_DOWN, 1_000)), "capped");
+        for nothing in [ScrollTarget::Lines(0), ScrollTarget::Pages(0.0), ScrollTarget::Top, ScrollTarget::Bottom] {
+            assert_eq!(scroll_keys(&nothing), None, "{nothing:?}");
+        }
     }
 
     #[test]

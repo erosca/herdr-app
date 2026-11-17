@@ -75,7 +75,7 @@ export function playSound(sound: string): null;
  *   terminal.clear_selection {terminal?}. No default keys or built-in copy mode.
  *   terminal.select_all {terminal?} (whole screen and scrollback, or only the alternate screen; Cmd+A on macOS).
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
- *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
+ *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?, keys?} (Herdr's view of the history: negative goes up; pages may be fractional; keys: true sends a full-screen program PageUp/PageDown or arrows instead).
  * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too).
  * Layout (the shown layout's nodes by id): layout.toggle|show|hide {id}, layout.resize {id, px | weight},
  *   layout.select {stack, child}, layout.set {layout} (personal trees; shipped layouts: click/look fields only), layout.switch {name?} (no name: the next one).

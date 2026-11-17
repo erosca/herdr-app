@@ -638,10 +638,12 @@ The main ones:
   `terminal.right_click {to: "program" | "menu", terminal?}` (where right-clicks go
   when the program takes the mouse; kept as its label `herdr.right-click=program`;
   Shift+right-click is always Herdr's menu),
-  `terminal.scroll {lines | pages | to: "top" | "bottom", terminal?}` (moves Herdr's view of the
+  `terminal.scroll {lines | pages | to: "top" | "bottom", terminal?, keys?}` (moves Herdr's view of the
   history, not the program: negative lines or pages go up, toward history; pages may be
   fractional, one page is the terminal's rows; on the alternate screen, such as vim or less,
-  there is no history, so nothing moves),
+  there is no history, so nothing moves, unless `keys: true`: then the program gets
+  PageUp/PageDown for pages and arrow keys for lines; Shift+PageUp/PageDown scroll a page
+  that way),
   `terminal.select {terminal?, at?: {row, col} | "cursor", mode?: "cell" | "word" | "line"}`
   (replaces the selection, at the program's cursor by default; word/line act like double/triple click),
   `terminal.adjust_selection {terminal?, direction}` (left, right, up, down, page_up, page_down,
