@@ -57,6 +57,19 @@ pub(crate) fn grid_size(bounds: Size<Pixels>, cell: Size<Pixels>) -> (u16, u16) 
     (cols, rows)
 }
 
+/// Puts a terminal with new output on the list for the output clock's next
+/// tick; true when the list was empty, so the clock has to start. A terminal
+/// already waiting starts nothing: it used to start a timer for every chunk of
+/// output, and one printing terminal then drew on every frame (60 a second on a
+/// 60 Hz display, not ~30).
+fn join_clock<T>(waiting: &mut Vec<T>, me: T, same: impl Fn(&T, &T) -> bool) -> bool {
+    if waiting.iter().any(|w| same(w, &me)) {
+        return false;
+    }
+    waiting.push(me);
+    waiting.len() == 1
+}
+
 pub fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c.0 as f32 / 255.0, g: c.1 as f32 / 255.0, b: c.2 as f32 / 255.0, a: 1.0 }.into()
 }
@@ -635,13 +648,7 @@ impl TerminalView {
             return;
         }
         let me = cx.entity().downgrade();
-        let start = OUTPUT_CLOCK.with(|c| {
-            let mut c = c.borrow_mut();
-            if !c.iter().any(|w| w.entity_id() == me.entity_id()) {
-                c.push(me);
-            }
-            c.len() == 1
-        });
+        let start = OUTPUT_CLOCK.with(|c| join_clock(&mut c.borrow_mut(), me, |a, b| a.entity_id() == b.entity_id()));
         if start {
             cx.spawn(async |_, cx| {
                 cx.background_executor().timer(Duration::from_millis(33)).await;
@@ -3639,6 +3646,18 @@ mod tests {
         for nothing in [ScrollTarget::Lines(0), ScrollTarget::Pages(0.0), ScrollTarget::Top, ScrollTarget::Bottom] {
             assert_eq!(scroll_keys(&nothing), None, "{nothing:?}");
         }
+    }
+
+    #[test]
+    fn the_output_clock_starts_once_a_tick() {
+        let same = |a: &u32, b: &u32| a == b;
+        let mut waiting = Vec::new();
+        assert!(super::join_clock(&mut waiting, 1, same), "the first output starts the clock");
+        assert!(!super::join_clock(&mut waiting, 1, same), "more output from a waiting terminal starts nothing");
+        assert!(!super::join_clock(&mut waiting, 2, same), "another terminal rides the same tick");
+        assert_eq!(waiting, [1, 2]);
+        waiting.clear(); // the tick
+        assert!(super::join_clock(&mut waiting, 1, same), "output after the tick starts the next one");
     }
 
     #[test]
