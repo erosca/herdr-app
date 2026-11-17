@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sets up Herdr on this machine from this fork: builds the patched app, points the
 # launcher at it, and merges the personal settings in personal/ (keys, look,
-# themes, fonts, the shell's keys in inputrc) and installs the personal agents
+# themes, fonts, the shell's keys in inputrc, vim's wheel) and installs the personal agents
 # (bin/, hc-templates/, programs.json). Linux only. Safe to re-run: changed
 # files are backed up first.
 #
@@ -199,6 +199,20 @@ else
   echo "Shells already open (Herdr keeps them across restarts) need: bind -f $inputrc"
 fi
 [[ ${SHELL##*/} == zsh ]] && echo "note: your shell is zsh; add to ~/.zshrc: bindkey '^[[27;2;13~' accept-line '^[[1;5D' backward-word '^[[1;5C' forward-word"
+
+# Vim's wheel inside Herdr (a plugin, so ~/.vimrc stays as it is; Neovim too, if it's here).
+plugins=("$HOME/.vim/plugin/herdr-wheel.vim")
+command -v nvim >/dev/null 2>&1 && plugins+=("${XDG_CONFIG_HOME:-$HOME/.config}/nvim/plugin/herdr-wheel.vim")
+say "Vim's mouse wheel"
+for target in "${plugins[@]}"; do
+  if cmp -s "$here/vim/herdr-wheel.vim" "$target"; then
+    echo "  unchanged: $target"
+  else
+    mkdir -p "$(dirname "$target")"
+    cp "$here/vim/herdr-wheel.vim" "$target"
+    echo "  wrote:     $target"
+  fi
+done
 
 say "Done"
 echo "Quit Herdr completely and open it again to use the new build and settings."
