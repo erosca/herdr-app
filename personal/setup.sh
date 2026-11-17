@@ -55,7 +55,7 @@ find_zig() {
 if $build; then
   say "Building herdr-app (release)"
   command -v cargo >/dev/null || {
-    echo "needs Rust (CI uses 1.95.0): https://rustup.rs" >&2
+    echo "needs Rust (CI uses 1.95.0): personal/install-prereqs.sh installs it" >&2
     exit 1
   }
   if ! zig=$(find_zig); then
@@ -72,10 +72,8 @@ if $build; then
   if ! (cd "$repo" && ZIG="$zig" cargo build --release --locked); then
     cat >&2 <<'EOF'
 
-The build failed. On Debian/Ubuntu these packages are what CI installs:
-  sudo apt-get install pkg-config clang libclang-dev libxcb1-dev libxkbcommon-dev \
-    libxkbcommon-x11-dev libwayland-dev libvulkan-dev mesa-vulkan-drivers \
-    libfontconfig-dev libfreetype-dev
+The build failed. personal/install-prereqs.sh --check lists what's missing of
+what CI installs, and personal/install-prereqs.sh installs it.
 EOF
     exit 1
   fi
