@@ -1358,6 +1358,16 @@ impl Vt {
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
     }
 
+    /// Where the view is in the history, in rows: (all rows, the top visible
+    /// row, how many are visible). The view is at the bottom when the last two
+    /// add up to the first. Cheap enough to read on every frame (libghostty keeps
+    /// it as the terminal changes).
+    pub fn scrollbar(&self) -> Option<(u64, u64, u64)> {
+        let mut s = GhosttyTerminalScrollbar::default();
+        let ok = unsafe { ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &mut s as *mut _ as *mut c_void) };
+        (ok == GHOSTTY_SUCCESS).then_some((s.total, s.offset, s.len))
+    }
+
     /// Wraps pasted text the way the program asked (bracketed paste or not).
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         if self.mode(BRACKETED_PASTE) {
@@ -1707,6 +1717,29 @@ mod tests {
         // Back to Herdr's 10,000: the oldest lines go at once.
         vt.set_theme(theme());
         assert!(!first_line(&mut vt).starts_with("00001"));
+    }
+
+    #[test]
+    fn the_scrollbar_says_where_the_view_is_in_the_history() {
+        let mut vt = Vt::new(80, 25);
+        let (total, offset, len) = vt.scrollbar().unwrap();
+        assert_eq!((offset + len, len), (total, 25), "a new terminal is at the bottom");
+        for line in 1..=100 {
+            vt.write(format!("{line}\r\n").as_bytes());
+        }
+        let (total, offset, len) = vt.scrollbar().unwrap();
+        assert!(total > len, "history above the screen: {total}");
+        assert_eq!(offset + len, total, "output keeps the view at the bottom");
+        vt.scroll_viewport(-10);
+        assert_eq!(vt.scrollbar(), Some((total, total - len - 10, len)), "ten rows up");
+        vt.scroll_viewport(-10_000);
+        assert_eq!(vt.scrollbar(), Some((total, 0, len)), "at the top");
+        vt.scroll_to_bottom();
+        assert_eq!(vt.scrollbar(), Some((total, total - len, len)));
+        // The alternate screen (a pager, an editor) has no history to show.
+        vt.write(b"\x1b[?1049h");
+        let (total, offset, len) = vt.scrollbar().unwrap();
+        assert_eq!(offset + len, total, "{total} {offset} {len}");
     }
 
     #[test]

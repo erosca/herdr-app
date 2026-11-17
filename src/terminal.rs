@@ -1195,6 +1195,18 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
     ops
 }
 
+/// The scroll bar's thumb as (top, height) in a track of (top, height), from
+/// libghostty's (all rows, top visible row, visible rows). None at the bottom of
+/// the history, where the bar hides. Its length is the share of the history on
+/// screen, but never under `min`, so a long history still shows one.
+fn scroll_thumb((total, offset, len): (u64, u64, u64), (top, height): (f32, f32), min: f32) -> Option<(f32, f32)> {
+    if offset.saturating_add(len) >= total {
+        return None;
+    }
+    let thumb = (height * len as f32 / total as f32).max(min).min(height);
+    Some((top + (height - thumb) * offset as f32 / (total - len) as f32, thumb))
+}
+
 fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
@@ -1236,6 +1248,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     g.images.retain(|k, _| keep.contains(k));
     let link_spans = g.link_spans.clone();
     let marked = g.marked.clone();
+    let scrollbar = g.vt.scrollbar();
+    let rows = g.vt.rows as f32;
     drop(g);
 
     window.paint_quad(fill(bounds, hsla(frame.bg).opacity(crate::settings::get().terminal_opacity)));
@@ -1360,6 +1374,18 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let line = window.text_system().shape_line(text.into(), px(crate::settings::font_size()), &[run], None);
         window.paint_quad(fill(snap_box(Bounds::new(p, size(line.width, cell.height))), hsla(frame.bg)));
         let _ = line.paint(p, cell.height, TextAlign::Left, None, window, cx);
+    }
+    // Scrolled up into the history, a faint thumb in the right padding shows
+    // where the view is: alongside the rows, never over text, not clickable. At
+    // the bottom, where the work is, nothing.
+    let track = (f32::from(origin.y), f32::from(cell.height) * rows);
+    if let Some((top, height)) = scrollbar.and_then(|s| scroll_thumb(s, track, f32::from(cell.height) * 2.0)) {
+        let zoom = crate::settings::zoom();
+        let width = 3.0 * zoom;
+        // Centered in the padding; at the edge when the padding is too thin.
+        let center = f32::from(bounds.origin.x + bounds.size.width) - (pad_x / 2.0).max(width / 2.0 + zoom);
+        let thumb = snap_box(Bounds::new(point(px(center - width / 2.0), px(top)), size(px(width), px(height))));
+        window.paint_quad(fill(thumb, hsla(vt::theme().fg).opacity(0.22)).corner_radii(thumb.size.width / 2.0));
     }
     grid.borrow_mut().cursor_at = frame.cursor_cell.map(|(x, y)| Bounds::new(at(x as usize, y as usize), cell));
 }
@@ -1635,6 +1661,26 @@ impl Scroll {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scroll_thumb_shows_where_the_view_is_and_hides_at_the_bottom() {
+        let thumb = |rows, min| super::scroll_thumb(rows, (10.0, 100.0), min);
+        let near = |got: Option<(f32, f32)>, want: (f32, f32)| {
+            got.is_some_and(|(t, h)| (t - want.0).abs() < 1e-3 && (h - want.1).abs() < 1e-3)
+        };
+        assert_eq!(thumb((100, 75, 25), 8.0), None, "at the bottom: no bar");
+        assert_eq!(thumb((25, 0, 25), 8.0), None, "no history: no bar");
+        // As long as the share of the history on screen, as far down as the view is.
+        assert!(near(thumb((100, 0, 25), 8.0), (10.0, 25.0)), "{:?}", thumb((100, 0, 25), 8.0));
+        assert!(near(thumb((100, 25, 25), 8.0), (35.0, 25.0)), "{:?}", thumb((100, 25, 25), 8.0));
+        assert!(near(thumb((100, 74, 25), 8.0), (84.0, 25.0)), "{:?}", thumb((100, 74, 25), 8.0));
+        // A long history: never shorter than the minimum, and still inside the track.
+        assert!(near(thumb((1_000_000, 0, 25), 8.0), (10.0, 8.0)));
+        let (top, h) = thumb((1_000_000, 999_974, 25), 8.0).unwrap();
+        assert!(h == 8.0 && top > 101.9 && top + h <= 110.0, "{top} {h}");
+        // A pane shorter than the minimum: the whole track.
+        assert!(near(thumb((1_000, 500, 25), 200.0), (10.0, 100.0)));
+    }
+
     #[test]
     fn shift_extends_a_selection_only_where_the_program_leaves_the_mouse_to_herdr() {
         assert!(super::press_extends(true, false), "a shell: Shift+click grows the selection");
