@@ -57,7 +57,7 @@ for file in LICENSE THIRD-PARTY-NOTICES; do
   [[ -f $repo/$file ]] && cp "$repo/$file" "$root/"
 done
 # Not capture.sh: it saves a machine's settings back into git.
-for file in setup.sh herdr-app.in keys.json settings.json programs.json inputrc README.md \
+for file in setup.sh herdr-app.in keys.json settings.json programs.json inputrc vim README.md \
   themes fonts bin hc-templates; do
   [[ -e $here/$file ]] && cp -a "$here/$file" "$root/personal/"
 done

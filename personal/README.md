@@ -72,6 +72,7 @@ itself to upstream's release.
 | `themes/*.json` | copied to `themes/` | e.g. `tilix.json` |
 | `fonts/*` | copied to `fonts/` | for machines that lack the font |
 | `inputrc` | added to `~/.inputrc` (bash), when missing | Shift+Enter runs the command line instead of printing `;2;13~`; Ctrl+Left/Right move by word |
+| `vim/herdr-wheel.vim` | `~/.vim/plugin/` (and Neovim's, if it's installed) | inside Herdr, a wheel notch scrolls vim 3 lines: Herdr sends a program that takes the mouse a report per line, 3 a notch, and vim scrolled 3 lines a report |
 | `bin/*` | `~/.local/bin/` | agents' programs, e.g. `dummy-agent` |
 | `hc-templates/*.md` | `~/.config/herdr-core/templates/` | agents `hc run` starts by name |
 | `programs.json` | merged into `programs.json` | agents' names and tiles in Herdr, and its menu of agents to start |
