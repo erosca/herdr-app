@@ -99,6 +99,19 @@ fn partial_redraw_requested(adapter: &wgpu::AdapterInfo) -> bool {
     enabled
 }
 
+/// HERDR (HERDR_LATENCY_EXPERIMENT): `HERDR_TEST_PRESENT_MODE=fifo|immediate|mailbox|fifo-relaxed`
+/// picks the window's presentation mode, for latency tests.
+fn test_present_mode() -> Option<wgpu::PresentMode> {
+    let mode = std::env::var("HERDR_TEST_PRESENT_MODE").ok()?;
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        "fifo-relaxed" | "fifo_relaxed" | "fiforelaxed" => Some(wgpu::PresentMode::FifoRelaxed),
+        _ => None,
+    }
+}
+
 /// HERDR: opt-in frame diagnostics, read once.
 ///
 /// `HERDR_RENDER_TRACE=1` prints one `[HERDR_RENDER_TRACE]` line per window frame to stderr:
@@ -810,15 +823,28 @@ impl WgpuRenderer {
             );
         }
 
+        // HERDR (HERDR_LATENCY_EXPERIMENT): `HERDR_TEST_PRESENT_MODE` overrides the window's
+        // presentation mode for latency tests; an unsupported mode falls back to Fifo as usual.
+        let requested_present_mode = test_present_mode().or(config.preferred_present_mode);
+        let present_mode = requested_present_mode
+            .filter(|mode| surface_caps.present_modes.contains(mode))
+            .unwrap_or(wgpu::PresentMode::Fifo);
+        if std::env::var_os("HERDR_TEST_PRESENT_MODE").is_some()
+            || std::env::var_os("HERDR_TEST_GPU_BACKEND").is_some()
+        {
+            eprintln!(
+                "[HERDR_LATENCY_EXPERIMENT] requested={requested_present_mode:?} \
+                 chosen={present_mode:?} available={:?}",
+                surface_caps.present_modes
+            );
+        }
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
