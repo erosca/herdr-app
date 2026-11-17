@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""dummy-agent: the smallest agent for Herdr and herdr-core (hc), to try their agent
+features with. Each question, typed or sent with `hc send`, takes DUMMY_AGENT_DELAY
+seconds (default 10), then the answer is "done".
+
+It tells the terminal what it is doing through OSC 7501, the Program Status Protocol:
+idle when it waits for a question, working while it "thinks", done when it answered.
+So Herdr lists it as an agent, shows it working, and plays a sound and posts a
+"finished" notification when it answers while you look at something else; `hc wait`
+returns when it answers, and a parent agent gets its news.
+
+    dummy-agent                     ask in its terminal
+    hc run --bg --name d dummy "Is it done?"; hc wait d; hc read d --lines 5
+
+Ctrl+C stops an answer (`hc interrupt d` too), Ctrl+D quits.
+"""
+import base64
+import os
+import re
+import sys
+import time
+
+APP = "dummy"                                  # the `app` it reports (programs.json key)
+PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+# Escape sequences a key may leave in a line (Shift+Enter, arrows): not part of a question.
+KEYS = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
+
+
+def delay():
+    try:
+        return max(0.0, float(os.environ.get("DUMMY_AGENT_DELAY", "10")))
+    except ValueError:
+        return 10.0
+
+
+def report(state, msg=""):
+    """One OSC 7501 report: STATE, our app name, and MSG (base64, as the protocol wants)."""
+    fields = ["state=" + state, "app=" + APP]
+    if msg:
+        fields.append("msg=" + base64.b64encode(msg[:200].encode()).decode())
+    sys.stdout.write("\x1b]7501;" + ":".join(fields) + "\x1b\\")
+    sys.stdout.flush()
+
+
+def short(text, n=60):
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def read_question():
+    """The next question: a typed line, or a whole paste and the Enter after it (a
+    template's first message and `hc send` text are pastes, often of several lines).
+    None at the end of input."""
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    text = line
+    while PASTE_START in text and PASTE_END not in text:
+        more = sys.stdin.readline()
+        if not more:
+            break
+        text += more
+    return KEYS.sub("", text.replace(PASTE_START, "").replace(PASTE_END, "")).strip()
+
+
+class Terminal:
+    """Pastes come bracketed, so a paste of several lines is one question; the markers
+    are echoed raw (not as ^[[200~), which a terminal draws as nothing."""
+
+    def __init__(self):
+        self.fd, self.saved = sys.stdin.fileno(), None
+        if not os.isatty(self.fd):
+            return
+        import termios
+        self.saved = termios.tcgetattr(self.fd)
+        mode = termios.tcgetattr(self.fd)
+        mode[3] &= ~termios.ECHOCTL
+        termios.tcsetattr(self.fd, termios.TCSANOW, mode)
+        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.flush()
+
+    def restore(self):
+        if self.saved is None:
+            return
+        import termios
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+        termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+
+
+def main():
+    seconds = delay()
+    terminal = Terminal()
+    try:
+        print(f"Dummy agent: ask anything; every answer takes {seconds:g} s. "
+              "Ctrl+C stops an answer, Ctrl+D quits.", flush=True)
+        state = ("idle", "")
+        while True:
+            # Report only once ready for input: a template's first message waits for it.
+            report(*state)
+            sys.stdout.write("> ")
+            sys.stdout.flush()
+            try:
+                question = read_question()
+            except KeyboardInterrupt:
+                print(flush=True)
+                state = ("idle", "")
+                continue
+            if question is None:
+                print(flush=True)
+                return 0
+            if not question:
+                state = ("idle", "")
+                continue
+            report("working", "thinking about: " + short(question))
+            try:
+                time.sleep(seconds)
+            except KeyboardInterrupt:
+                print("\n(stopped)", flush=True)
+                state = ("idle", "stopped")
+                continue
+            print("done", flush=True)
+            state = ("done", "answered: " + short(question))
+    finally:
+        terminal.restore()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
