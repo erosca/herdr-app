@@ -9,9 +9,8 @@ draws: the family that the profile's font resolves to (as fontconfig resolves
 
 Tilix stores some colors with 16 bits per channel (#RRRRGGGGBBBB); those are
 read as 8 bits. With "Use theme colors" on, Tilix keeps no background or text
-color, so the measured #181818 / #ffffff are used. With "Show bold text in
-bright colors" on, normal blue takes bright blue (`ls` directories are bold),
-since Herdr has no such option.
+color, so the measured #181818 / #ffffff are used. "Show bold text in bright
+colors" becomes settings.json's bold_is_bright (with a settings.json given).
 """
 import json
 import pathlib
@@ -82,11 +81,11 @@ def font(profile):
     return family, size * dpi / 72.0, desc, dpi
 
 
-def set_font(profile, settings_path):
+def set_font(profile, settings_path, bold_is_bright):
     family, pixels, desc, dpi = font(profile)
     path = pathlib.Path(settings_path)
     settings = json.loads(path.read_text()) if path.exists() else {}
-    settings.update({"font": family, "font_size": round(pixels, 2), "zoom": 1.0})
+    settings.update({"font": family, "font_size": round(pixels, 2), "zoom": 1.0, "bold_is_bright": bold_is_bright})
     path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
     at = f" at {dpi:g} dpi" if dpi else ""
     print(f"  font:      Tilix {desc!r}{at} = {family} {pixels:g} px")
@@ -109,14 +108,13 @@ def main(out, settings=None):
     }
     if get(profile, "use-cursor-color") == "true":
         theme["cursor"] = colors(get(profile, "cursor-background-color"))[0]
-    if get(profile, "bold-is-bright") == "true":
-        theme["ansi"][4] = theme["ansi"][12]
+    bold_is_bright = get(profile, "bold-is-bright") == "true"
     path = pathlib.Path(out)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(theme, indent=2) + "\n")
     print(f"  wrote:     {path}")
     if settings:
-        set_font(profile, settings)
+        set_font(profile, settings, bold_is_bright)
 
 
 if __name__ == "__main__":
