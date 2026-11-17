@@ -1753,7 +1753,7 @@ impl AppWindow {
         // keys: true (Shift+PageUp/PageDown): a full-screen program gets keys instead.
         let keys = args.get("keys").and_then(Value::as_bool).unwrap_or(false);
         view.update(cx, |view, cx| {
-            if !(keys && view.send_scroll_keys(&target)) {
+            if !(keys && view.send_scroll_keys(&target, cx)) {
                 view.scroll_history(target, cx);
             }
         });
