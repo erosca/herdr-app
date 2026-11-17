@@ -495,10 +495,11 @@ impl Core {
         Ok((channel, rx, result))
     }
 
-    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> {
+    /// `history`: how many lines of the terminal's history the core sends first.
+    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, history: usize, display: Value) -> Result<Attached> {
         let result = self.call(
             "terminal.attach",
-            json!({"terminal": terminal, "cols": cols, "rows": rows, "history": 2000, "display": display}),
+            json!({"terminal": terminal, "cols": cols, "rows": rows, "history": history, "display": display}),
         )?;
         let channel = result["channel"].as_u64().ok_or_else(|| anyhow!("attach returned no channel"))? as u32;
         let (tx, rx) = async_channel::unbounded();
@@ -807,8 +808,8 @@ mod tests {
         );
         let result = core.call("terminal.run", json!({"argv": ["sh", "-c", program]})).unwrap();
         let t = result["address"].as_str().unwrap();
-        let idle = core.attach(t, 80, 24, json!({})).unwrap();
-        let leader = core.attach(t, 100, 30, json!({})).unwrap();
+        let idle = core.attach(t, 80, 24, 2000, json!({})).unwrap();
+        let leader = core.attach(t, 100, 30, 2000, json!({})).unwrap();
         let capable = core.routes.lock().unwrap().automatic_input.contains(&idle.channel);
         let mut idle_vt = crate::vt::Vt::new(80, 24);
         let mut leader_vt = crate::vt::Vt::new(100, 30);

@@ -439,7 +439,8 @@ impl TerminalView {
                 let facts = display_update(&mut g.told_display, &vt::theme(), cell).unwrap();
                 (g.vt.cols, g.vt.rows, facts)
             }) else { return };
-            let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
+            let history = crate::settings::get().attach_history();
+            let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, history, facts) }).await;
             let Ok(Some(rx)) = this.update(cx, |this, cx| this.attached(attached, (cols, rows), cx)) else {
                 return;
             };
