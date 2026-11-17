@@ -155,6 +155,54 @@ the highlighted line shows where it will land.
   records the starter as `parent` (see `terminals()`). They belong to their
   parent's tab without a pane; the `agents` mod shows them,
   `terminal.peek` opens one, `terminal.keep` gives one a pane.
+  `terminals()` lists live terminals only; the `agents` mod shows the running
+  ones under their agent, always, each with how long it has been in its state
+  (working 12m), and gets finished ones from `hc ls --all --json`:
+  their agent's row counts them ("18 done", failures in red) while the core keeps
+  them. The count unfolds them, the newest five first (the rest, and Clear all, a
+  click further); clicking the row itself only goes to the agent. Hovering one
+  offers dismiss; shared `"agents.finished": false` hides them. A sub-agent shows
+  as its `herdr.title` label (what its parent called the task), else its name.
+  Clicking a done one opens its conversation:
+  each round's request, its work folded into one line ("Worked 3m 12s · 14 steps ·
+  41.2k tokens": inside, each step it took, its terminal output a click further)
+  and its answer as Markdown; a step cut to one line unfolds on a click. Each
+  round names the model and effort it ran with, and its request is a quoted block
+  of selectable Markdown, its first lines shown until Show all. Copy request and
+  Copy answer copy them as Markdown, Copy output what a working one printed. A codex, Kimi
+  Code or Antigravity (agy) sub-agent still working opens the same window: its request, how long and
+  how far it is (from its log), what it is doing now, and what it prints as it
+  prints it, read from its terminal every second as selectable text that follows
+  the newest line; scrolling up, dragging its scroll bar or pressing in it to
+  select holds it still (↓ Latest or End follows again). The window
+  only reads: no key reaches the agent, which takes its requests from its
+  parent alone; a round that ends while it is open turns into its answer in
+  place. Any other running sub-agent, and one that needs the person, opens as
+  its terminal (`terminal.peek`), whose bar has Conversation for a codex,
+  Kimi Code or Antigravity one. Another mod opens a running sub-agent's conversation with
+  `openOverlay({ mod: "agents", kind: "dialog", width: 0.8, height: 0.8, props: {
+  conversation: "<address>" } })`. A follow-up
+  under the same `--name` and parent, or with the same `herdr.session` label, is
+  the next round of the same conversation. Each round comes from the run's labels
+  `herdr.request=<file>`, `herdr.answer=<file>` (absolute paths) and
+  `herdr.session=<session id>`, else from the agent's own session log on the
+  machine the run was on, which holds everything: codex's (`$CODEX_HOME` or
+  `~/.codex`, `sessions/`) and Kimi Code's (`$KIMI_CODE_HOME` or `~/.kimi-code`,
+  `sessions/`). The log is the session whose id is on the command line (as in
+  `codex exec resume <id>`, `kimi -S <id>`, also as a wrapper script's argument),
+  else the one in the run's folder with a turn that began while the run was alive;
+  a wrapper script is fine, and so is a prompt on stdin. Antigravity's own store
+  can't be read: an agy run is read from the events `agy -p ... --output-format
+  stream-json` printed, saved to a file of the run's own, named by its label
+  `herdr.events=<file>`, else `events.jsonl` beside its request or answer file,
+  else `REPORT.events` of a `run-reviewer.sh agy WORKSPACE BRIEF REPORT [SESSION]`
+  command line (whose BRIEF is then its request). Without a log a round shows
+  the request from the command line and the last 1000 lines of output, and a line
+  saying why no log was found. Asking a reviewer:
+  `hc run --name reviewer -- codex exec -s workspace-write -o $PWD/.review/ans-1.md "$(cat .review/req-1.md)"`;
+  a follow-up, under the same name:
+  `codex exec -s workspace-write resume <session id> -o <answer file> "<question>"`
+  (codex takes `-s` and `--color` before `resume`, not after).
   Ctrl-click (Cmd-click on macOS) a live terminal address in terminal text to
   peek at it. Bare addresses refer to the machine of the terminal showing them;
   use `machine/address` for another machine. Names and non-live addresses aren't links.

@@ -1,0 +1,54 @@
+// Helpers the agents list and the conversation window share.
+
+import { image, svg } from "gpui-kit";
+
+// The agent's icon from the app's program table: a one-color glyph or a picture.
+export function icon(p, size, color) {
+  if (!p?.icon) return null;
+  return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
+}
+
+// How a finished sub-agent ended, when that's worth a word: a clean exit says nothing.
+export function ending(k) {
+  if (k.reason === "killed") return { text: "stopped", bad: false };
+  if (k.exit_code != null && k.exit_code !== 0) return { text: `exit ${k.exit_code}`, bad: true };
+  if (k.signal != null) return { text: `signal ${k.signal}`, bad: true };
+  if (k.exit_code == null && k.reason && k.reason !== "exited") return { text: "lost", bad: true };
+  return null;
+}
+
+export function span(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+export function clock(ms) {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// A sub-agent's name as a row shows it: its `herdr.title` label (what its parent called
+// the task), else its terminal name, without what relay adds to make it unique
+// (`codex-review-of-terms-a7e8d3` is "review of terms": the icon says codex). Null
+// when it has neither.
+export function shownName(k) {
+  const title = k?.labels?.["herdr.title"];
+  if (title) return title;
+  const name = k?.name || k?.template || null;
+  const relay = name?.match(/^(?:codex|kimi|agy|fake)-(.+)-[0-9a-z]{6}(?:-\d)?$/);
+  return relay ? relay[1].replace(/-/g, " ") : name;
+}
+
+// The window a sub-agent opens as, as openOverlay takes it: most of Herdr's window, as a
+// peek, but no wider than it is on a full-HD screen. What makes it readable is how many
+// characters a line holds, and at the same zoom a pixel holds the same text on any screen:
+// wider than this, on a QHD or 4K screen, a line of its answer runs to 250 characters and
+// more. (Herdr's zoom scales the width with the text.)
+const BIG = { kind: "dialog", width: 0.8, height: 0.8, max_width: 1536 };
+
+/** Its conversation: each round's request, work and answer. `find`: the conversation's
+ * finished runs are asked of the core first (the opener's list may lack the newest). */
+export const conversationOf = (thread, runs, live, find = false) => ({ mod: "agents", ...BIG, props: { thread, runs, live, find } });
