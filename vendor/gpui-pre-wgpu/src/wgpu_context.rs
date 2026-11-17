@@ -471,12 +471,29 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: Self::backends(),
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display,
         })
+    }
+
+    /// HERDR (HERDR_LATENCY_EXPERIMENT): `HERDR_TEST_GPU_BACKEND=gl` or `=vulkan` limits the
+    /// adapters to one backend, e.g. to compare GL and Vulkan on a software rasterizer or to
+    /// avoid a backend that cannot present on a display. Unset, both are tried.
+    #[cfg(not(target_family = "wasm"))]
+    fn backends() -> wgpu::Backends {
+        let backends = match std::env::var("HERDR_TEST_GPU_BACKEND")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("gl" | "opengl" | "gles") => wgpu::Backends::GL,
+            Ok("vulkan" | "vk") => wgpu::Backends::VULKAN,
+            _ => return wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        };
+        eprintln!("[HERDR_LATENCY_EXPERIMENT] backends={backends:?}");
+        backends
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
