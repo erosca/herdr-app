@@ -1,0 +1,18 @@
+{
+  "terminal": {
+    "ctrl-insert": "terminal.copy",
+    "shift-insert": "terminal.paste",
+    "shift-pageup": {"command": "terminal.scroll", "args": {"pages": -1, "keys": true}},
+    "shift-pagedown": {"command": "terminal.scroll", "args": {"pages": 1, "keys": true}},
+    "ctrl-shift-up": "pane.go:up",
+    "ctrl-shift-down": "pane.go:down",
+    "ctrl-shift-left": "pane.go:left",
+    "ctrl-shift-right": "pane.go:right"
+  },
+  "global": {
+    "ctrl-shift-up": "pane.go:up",
+    "ctrl-shift-down": "pane.go:down",
+    "ctrl-shift-left": "pane.go:left",
+    "ctrl-shift-right": "pane.go:right"
+  }
+}

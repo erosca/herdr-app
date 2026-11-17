@@ -1,0 +1,10 @@
+{
+  "theme": "tilix",
+  "font": "DejaVu Sans Mono",
+  "font_size": 12.0,
+  "font_weight": 400,
+  "terminal_line_height": 1.05,
+  "zoom": 1.0,
+  "appearance": "dark",
+  "minimum_contrast": 1
+}
