@@ -1,0 +1,11 @@
+{
+  "programs": {
+    "dummy": {
+      "name": "Dummy agent",
+      "run": ["dummy-agent"],
+      "match": ["dummy-agent"],
+      "tile": "#475569",
+      "color": "#ffffff"
+    }
+  }
+}
