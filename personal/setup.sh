@@ -7,8 +7,8 @@
 #
 #   personal/setup.sh                 build, launcher, settings
 #   personal/setup.sh --nomachine     the same, plus the NoMachine lines in the
-#                                     launcher (software rendering: GL, partial
-#                                     redraw; WAYLAND_DISPLAY=no unset)
+#                                     launcher (WAYLAND_DISPLAY=no unset; partial
+#                                     redraw if it ever falls back to llvmpipe)
 #   options:
 #     --no-build      use the existing target/release/herdr-app
 #     --no-core       don't install herdr-core when it's missing
