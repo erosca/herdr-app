@@ -11,12 +11,18 @@ cells) and the settings below.
 ```sh
 git clone --branch claude/consolidated-on-321c9a8 https://github.com/erosca/herdr-app
 cd herdr-app
+personal/install-prereqs.sh    # build tools, as CI has them (sudo for missing packages)
 personal/setup.sh              # a machine with a GPU
 personal/setup.sh --nomachine  # a NoMachine desktop (software rendering)
 ```
 
-It builds the app (Rust 1.95+, Zig 0.16, downloaded to `~/.local/opt` if
-missing), installs herdr-core if there's none, points `~/.local/bin/herdr-app`
+`install-prereqs.sh` installs what's missing for building and testing: CI's
+build packages, Rust, Zig and Bun at CI's versions, `just`, and the
+`vendor/ghostty` submodule (`--check` only lists them, `--no-apt` skips what
+needs sudo, `--sandbox` adds what `scripts/sandbox` needs). Then `just test`
+runs what CI runs.
+
+`setup.sh` builds the app, installs herdr-core if there's none, points `~/.local/bin/herdr-app`
 and the Herdr menu entry at this build, and merges the files below into
 `~/.config/herdr-app` (and `~/.inputrc`). Re-run it after pulling to rebuild;
 changed settings files are backed up first. Then quit Herdr and open it again.
