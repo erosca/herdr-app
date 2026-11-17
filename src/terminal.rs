@@ -96,6 +96,8 @@ pub struct TerminalView {
     pub lost: bool,
     /// A left-button selection drag is in progress.
     selecting: bool,
+    /// This press (Shift+click) grows the selection there was rather than starting one.
+    extending: bool,
     selection_pointer: Point<Pixels>,
     selection_scroll: Option<Task<()>>,
     /// The terminal's folder, for links to relative paths.
@@ -193,6 +195,7 @@ impl TerminalView {
             ended: None,
             lost: false,
             selecting: false,
+            extending: false,
             selection_pointer: Point::default(),
             selection_scroll: None,
             cwd: None,
@@ -550,6 +553,8 @@ impl TerminalView {
             for _ in 0..n.min(Scroll::MAX_KEYS) {
                 bytes.extend(g.vt.encode_key(key, 0, 0, None, None));
             }
+            // The program redraws under a selection, as for the wheel (`Vt::wheel`).
+            g.vt.clear_selection();
             drop(g);
             self.send(&bytes);
         } else {
@@ -598,28 +603,13 @@ impl TerminalView {
         if n == 0 {
             return;
         }
-        let up = steps > 0;
-        if g.vt.mouse_tracking() {
-            let ((x, y), size) = mouse_at(&g, ev.position);
-            let button = if up { GHOSTTY_MOUSE_BUTTON_FOUR } else { GHOSTTY_MOUSE_BUTTON_FIVE };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
-            }
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
-        } else if g.vt.alt_screen() {
-            let key = if up { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_key(key, 0, 0, None, None));
-            }
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
-        } else {
-            g.vt.scroll_viewport(if up { -(n as isize) } else { n as isize });
+        // To the program (reported, or arrow keys on the alternate screen), which
+        // also clears a Shift selection; or Herdr's own history.
+        let ((x, y), size) = mouse_at(&g, ev.position);
+        if let Some(out) = g.vt.wheel(steps > 0, n, x, y, size)
+            && let Some(ch) = g.channel
+        {
+            g.core.input(ch, &out);
         }
         cx.notify();
     }
@@ -687,10 +677,19 @@ impl TerminalView {
         Some((target, hit.spans))
     }
 
-    fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    /// A left press Herdr selects with (see `press_extends`). With `extend` and
+    /// something selected, it grows that selection to here (scroll with
+    /// Shift+PageUp/PageDown in between to take in several pages); otherwise a new
+    /// selection starts.
+    fn start_selection(&mut self, pos: Point<Pixels>, extend: bool, cx: &mut Context<Self>) {
         self.selecting = true;
         self.selection_pointer = pos;
-        self.select(Select::Press, pos, cx);
+        self.extending = extend && self.extend_selection(pos);
+        if self.extending {
+            cx.notify();
+        } else {
+            self.select(Select::Press, pos, cx);
+        }
         self.selection_scroll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(50)).await;
@@ -722,14 +721,36 @@ impl TerminalView {
         if let Some(pos) = pos {
             drop(g);
             self.select(Select::Release, pos, cx);
-        } else {
+        } else if !self.extending {
+            // A drag cut short drops what it began; one that grew a selection keeps it.
             g.vt.clear_selection();
             cx.notify();
         }
+        self.extending = false;
+    }
+
+    /// Grows the selection to the cell under `pos`; false when nothing is selected.
+    fn extend_selection(&mut self, pos: Point<Pixels>) -> bool {
+        let mut g = self.grid.borrow_mut();
+        let (x, y) = local(&g, pos);
+        let (col, row) = ((x / f32::from(g.cell.width)) as u16, (y / f32::from(g.cell.height)) as u16);
+        g.vt.extend_selection(col, row)
     }
 
     /// Selecting with the mouse (when the program doesn't take it).
     fn select(&mut self, step: Select, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.extending {
+            // Dragging after a Shift+click keeps growing the same selection.
+            let grown = self.extend_selection(pos);
+            if matches!(step, Select::Release) {
+                self.extending = false;
+                if grown {
+                    self.copy(cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         let mut g = self.grid.borrow_mut();
         let (x, y) = local(&g, pos);
         let (cw, ch) = (f32::from(g.cell.width), f32::from(g.cell.height));
@@ -743,6 +764,14 @@ impl TerminalView {
         }
         cx.notify();
     }
+}
+
+/// Whether a left press grows the selection there is rather than starting one:
+/// with Shift, unless the program takes the mouse (vim with the mouse on). There
+/// Shift is what takes the mouse back, so each Shift+press starts a new selection,
+/// as in Ghostty and VTE terminals.
+fn press_extends(shift: bool, program_takes_mouse: bool) -> bool {
+    shift && !program_takes_mouse
 }
 
 fn selection_scroll_lines(y: f32, cell_height: f32, rows: u16) -> isize {
@@ -1451,7 +1480,8 @@ impl Render for TerminalView {
                     return;
                 }
                 if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
-                    this.start_selection(ev.position, cx);
+                    let extend = press_extends(ev.modifiers.shift, this.grid.borrow().vt.mouse_tracking());
+                    this.start_selection(ev.position, extend, cx);
                 }
             }))
             // Right-click is Herdr's menu, even when the program tracks the mouse
@@ -1604,6 +1634,13 @@ impl Scroll {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shift_extends_a_selection_only_where_the_program_leaves_the_mouse_to_herdr() {
+        assert!(super::press_extends(true, false), "a shell: Shift+click grows the selection");
+        assert!(!super::press_extends(true, true), "vim with the mouse: Shift+click starts a new one");
+        assert!(!super::press_extends(false, false), "a plain click starts a new one");
+    }
+
     #[test]
     fn the_output_clock_starts_once_a_tick() {
         let same = |a: &u32, b: &u32| a == b;
