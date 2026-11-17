@@ -64,6 +64,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.copy", &[], "Copy the focused terminal's selection."),
     cmd("terminal.paste", &[], "Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
+    cmd("terminal.scroll", &[req("by")], "Scroll the focused terminal's history by \"page_up\", \"page_down\", \"bottom\" or a number of lines (negative: up). A full-screen program (an editor, a pager) has no history here: it gets PageUp, PageDown or arrow keys instead."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),

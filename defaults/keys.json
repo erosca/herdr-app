@@ -67,6 +67,8 @@
     "ctrl-shift-v": "terminal.paste",
     "ctrl-v": "terminal.paste_image",
     "ctrl-insert": "terminal.copy",
-    "shift-insert": "terminal.paste"
+    "shift-insert": "terminal.paste",
+    "shift-pageup": "terminal.scroll:page_up",
+    "shift-pagedown": "terminal.scroll:page_down"
   }
 }
