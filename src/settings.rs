@@ -389,6 +389,10 @@ pub struct Person {
     pub clipboard_write: bool,
     /// Minimum terminal text contrast ratio; 1 leaves program colors unchanged.
     pub minimum_contrast: f32,
+    /// Selected terminal text swaps its text and background colors (as VTE terminals
+    /// do) instead of going on the theme's selection color.
+    #[serde(skip_serializing_if = "is_false")]
+    pub invert_selection: bool,
     /// macOS Option sends Alt shortcuts, or follows the keyboard layout.
     #[serde(skip_serializing_if = "OptionAsAlt::is_auto")]
     pub option_as_alt: OptionAsAlt,
@@ -435,6 +439,10 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl Default for Person {
     fn default() -> Self {
         Person {
@@ -447,6 +455,7 @@ impl Default for Person {
             telemetry: true,
             clipboard_write: true,
             minimum_contrast: 1.0,
+            invert_selection: false,
             option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
             theme: None,
@@ -481,6 +490,7 @@ pub struct Settings {
     pub terminal_opacity: f32,
     pub clipboard_write: bool,
     pub minimum_contrast: f32,
+    pub invert_selection: bool,
     pub option_as_alt: OptionAsAlt,
     pub sounds: Sounds,
 }
@@ -521,6 +531,7 @@ impl Default for Settings {
             terminal_opacity: 1.0,
             clipboard_write: true,
             minimum_contrast: 1.0,
+            invert_selection: false,
             option_as_alt: OptionAsAlt::Auto,
             sounds: Sounds::default(),
         }
@@ -558,6 +569,7 @@ impl Settings {
             sounds: person.sounds.clone(),
             clipboard_write: person.clipboard_write,
             minimum_contrast: person.minimum_contrast,
+            invert_selection: person.invert_selection,
             option_as_alt: person.option_as_alt,
         }
     }
@@ -877,6 +889,16 @@ mod tests {
     }
 
     #[test]
+    fn inverted_selections_are_off_by_default_and_left_out_of_settings_json() {
+        assert!(!serde_json::from_str::<Person>("{}").unwrap().invert_selection);
+        assert!(!Settings::default().invert_selection);
+        assert!(serde_json::to_value(Person::default()).unwrap().get("invert_selection").is_none());
+        let person: Person = serde_json::from_value(serde_json::json!({"invert_selection": true})).unwrap();
+        assert!(Settings::compose(&person, &crate::layout::Look::default(), true).invert_selection);
+        assert_eq!(serde_json::to_value(person).unwrap()["invert_selection"], serde_json::json!(true));
+    }
+
+    #[test]
     fn program_clipboard_writes_default_on_and_can_be_disabled() {
         let default: Person = serde_json::from_str("{}").unwrap();
         assert!(default.clipboard_write);
@@ -910,7 +932,7 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, invert_selection: true, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();
