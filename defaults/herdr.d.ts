@@ -352,6 +352,10 @@ export interface OverlaySpec {
   /** px, or up to 1: a share of the window. */
   width?: number;
   height?: number;
+  /** px: the most `width` / `height` take, whatever share of the window they ask for: a
+   *  dialog of `width: 0.8, max_width: 1536` is 80% of a small window, 1536 px of a wide one. */
+  max_width?: number;
+  max_height?: number;
   at?: "pointer" | { x: number; y: number };
 }
 
