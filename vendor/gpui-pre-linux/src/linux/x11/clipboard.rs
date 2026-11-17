@@ -718,7 +718,14 @@ impl Inner {
             log::trace!("Handling request for (probably) the clipboard contents.");
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                success = match data_list.iter().find(|d| d.format == event.target) {
+                // TARGETS offers UTF-8 text under its MIME names too, so serve them: a program
+                // that asks for one by name (Lazarus's Qt programs, Beyond Compare among them,
+                // ask for text/plain;charset=utf-8 when it is offered) otherwise gets nothing.
+                let utf8_alias = event.target == self.atoms.UTF8_MIME_0
+                    || event.target == self.atoms.UTF8_MIME_1;
+                success = match data_list.iter().find(|d| {
+                    d.format == event.target || (utf8_alias && d.format == self.atoms.UTF8_STRING)
+                }) {
                     Some(data) => {
                         self.server
                             .conn
