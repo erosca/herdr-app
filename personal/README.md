@@ -36,7 +36,7 @@ just herdr-core, which Herdr sets up when you add the machine.
 | `bin/*` | `~/.local/bin/` | agents' programs, e.g. `dummy-agent` |
 | `hc-templates/*.md` | `~/.config/herdr-core/templates/` | agents `hc run` starts by name |
 | `programs.json` | merged into `programs.json` | agents' names and tiles in Herdr, and its menu of agents to start |
-| `herdr-app.in` | `~/.local/bin/herdr-app-personal`, which `herdr-app` points at | `ZED_FONTS_GAMMA=1.0` everywhere; with `--nomachine` also GL, `HERDR_RENDER_PARTIAL=cpu` and the `WAYLAND_DISPLAY=no` fix |
+| `herdr-app.in` | `~/.local/bin/herdr-app-personal`, which `herdr-app` points at | `ZED_FONTS_GAMMA=1.0` everywhere; with `--nomachine` also the `WAYLAND_DISPLAY=no` fix, NVIDIA's driver sleeping while it waits (`__GL_YIELD=USLEEP`), at most 15 draws a second (`HERDR_MAX_FPS`) and `HERDR_RENDER_PARTIAL=cpu` |
 
 ## Saving changes from a machine
 
