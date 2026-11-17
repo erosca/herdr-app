@@ -897,6 +897,22 @@ impl LineLayoutCache {
 // otherwise they get displaced into the next cell. We detect them by checking
 // whether shaped x has advanced by at least half a cell beyond the last base.
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+    // HERDR: with HERDR_VTE_COMPAT, Herdr rounds terminal cells to whole pixels as VTE
+    // terminals do; every base glyph then goes exactly onto its cell, since the 1px
+    // tolerance would space glyphs unevenly against a cell wider than the advance.
+    let tolerance = if exact_grid() { px(0.) } else { px(1.) };
+    apply_force_width_with_tolerance(layout, force_width, tolerance);
+}
+
+/// HERDR: `HERDR_VTE_COMPAT=1` (read once): see `apply_force_width_to_layout`.
+fn exact_grid() -> bool {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXACT.get_or_init(|| {
+        std::env::var("HERDR_VTE_COMPAT").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+    })
+}
+
+fn apply_force_width_with_tolerance(layout: &mut LineLayout, force_width: Pixels, tolerance: Pixels) {
     let mut glyph_pos: usize = 0;
     // NEG_INFINITY ensures the first glyph is always classified as a base.
     let mut last_base_shaped_x = px(f32::NEG_INFINITY);
@@ -908,7 +924,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 
             if shaped_x > last_base_shaped_x + force_width * 0.5 {
                 let forced_x = glyph_pos * force_width;
-                if (shaped_x - forced_x).abs() > px(1.) {
+                if (shaped_x - forced_x).abs() > tolerance {
                     glyph.position.x = forced_x;
                 }
                 last_base_shaped_x = shaped_x;
@@ -1173,6 +1189,24 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_exact_grid_snaps_every_base() {
+        // HERDR_VTE_COMPAT: whole-pixel cells (7px) wider than the advance (6.5px).
+        let cell_width = px(7.);
+        let mut layout = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(6.5, 1),
+            glyph_at(13., 2),
+            glyph_at(13., 3), // combining mark on the base before it
+            glyph_at(19.5, 4),
+        ]);
+
+        apply_force_width_with_tolerance(&mut layout, cell_width, px(0.));
+
+        let positions = glyph_x_positions(&layout);
+        assert_eq!(positions, vec![0., 7., 14., 14., 21.]);
     }
 
     #[test]

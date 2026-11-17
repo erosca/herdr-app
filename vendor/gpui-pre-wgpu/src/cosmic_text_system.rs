@@ -520,7 +520,7 @@ impl CosmicTextSystemState {
             .swash_scale_context
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
-            .hint(true)
+            .hint(font_hinting())
             .build();
 
         let sources: &[Source] = if params.is_emoji {
@@ -914,6 +914,13 @@ impl CosmicTextSystemState {
             FallbackFontClass::Proportional
         }
     }
+}
+
+/// HERDR: `HERDR_FONT_HINTING=0` (read once) rasterizes glyph outlines unhinted, to
+/// compare with other programs' text; hinted otherwise, as upstream.
+fn font_hinting() -> bool {
+    static HINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HINT.get_or_init(|| std::env::var("HERDR_FONT_HINTING").map_or(true, |v| v.trim() != "0"))
 }
 
 #[inline(always)]
