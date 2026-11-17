@@ -390,10 +390,11 @@ impl Core {
         Ok((channel, rx, result))
     }
 
-    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> {
+    /// `history`: how many lines of the terminal's history the core sends first.
+    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, history: usize, display: Value) -> Result<Attached> {
         let result = self.call(
             "terminal.attach",
-            json!({"terminal": terminal, "cols": cols, "rows": rows, "history": 2000, "display": display}),
+            json!({"terminal": terminal, "cols": cols, "rows": rows, "history": history, "display": display}),
         )?;
         let channel = result["channel"].as_u64().ok_or_else(|| anyhow!("attach returned no channel"))? as u32;
         let (tx, rx) = async_channel::unbounded();
