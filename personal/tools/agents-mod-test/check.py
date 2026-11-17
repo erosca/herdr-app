@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Checks the agents mod's conversation window in Herdr's own engine.
+
+    personal/tools/agents-mod-test/check.py                  the fixture cases (below)
+    personal/tools/agents-mod-test/check.py --real t1g t1h   what the window makes of real runs, finished or still going
+        --as vm       as Herdr sees them from another computer: addressed vm/t1g, their
+                      logs read through `hc exec` (which is how a mod reaches a machine)
+        --together    as one conversation (a first run and its follow-ups)
+        --looks 3     a run still going is looked at that many times, each look reading
+                      its log on from the last, as the open window does every few seconds
+    personal/tools/agents-mod-test/check.py --splice           how the window reads on what a running
+                      one prints: a terminal printing bursts (in a core of its own) is read
+                      as the window reads it, and each join is compared with a full read
+
+Needs python3 and herdr-app (any build: the mod's files come from this checkout), and
+for --real or --as a running herdr-core. No node.
+
+How: `herdr-app check` loads driver.js with the mod's thread.js, conversation.js and
+util.js beside it. The mod's steps (find the session, read the log, ...) ask for
+commands; the engine can't wait for them, so the driver throws what it needs, this
+script runs it (the same `sh -c` the app would run, on the fixture homes or the real
+ones) and asks again until every case is through. Then each case's rounds are compared
+with what the fixtures hold, and each conversation is rendered for real, folded and
+with every fold open: an element method the engine doesn't know fails the check.
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import fixtures
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MOD = os.path.normpath(os.path.join(HERE, "../../../defaults/mods/agents"))
+CODEX = {"key": "codex", "name": "Codex", "icon": "icons/codex.svg", "tint": True}
+KIMI = {"key": "kimi", "name": "Kimi", "icon": "icons/kimi.svg", "tint": False}
+AGY = {"key": "antigravity", "name": "Antigravity", "icon": "icons/antigravity.svg", "tint": False}
+failed = 0
+
+
+def check(ok, what, got=None):
+    global failed
+    print(("PASS " if ok else "FAIL ") + what)
+    if not ok:
+        failed += 1
+        if got is not None:
+            print("     got: " + json.dumps(got)[:1500])
+
+
+def engine(folder):
+    r = subprocess.run(["herdr-app", "check", folder], capture_output=True, text=True, timeout=120)
+    return r.returncode == 0, r.stdout + r.stderr
+
+
+def build(folder, cases, answers, mode, view=None, opened=None, output=None):
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    for name in ("thread.js", "conversation.js", "util.js", "mod.json"):
+        shutil.copy(os.path.join(MOD, name), folder)
+    shutil.copy(os.path.join(HERE, "driver.js"), os.path.join(folder, "main.js"))
+    with open(os.path.join(folder, "cases.js"), "w") as f:
+        for name, value in (("CASES", cases), ("ANSWERS", answers), ("MODE", mode), ("VIEW", view), ("OPEN", opened), ("OUTPUT", output)):
+            f.write("export const %s = %s;\n" % (name, json.dumps(value)))
+
+
+def local(address):
+    return address.split("/")[-1]
+
+
+def host(request, world):
+    """Does what the app would for one request of the mod: {"value": ...} or {"error": ...}."""
+    kind = request[0]
+    if kind == "hc":
+        args = request[1]
+        if world.get("records") is not None:   # the fixtures' core
+            known = world["records"].get(args[1])
+            if not known:
+                return {"value": {"code": 1, "stdout": "", "stderr": "no such terminal"}}
+            out = known if args[0] == "get" else world["screens"][args[1]]
+            return {"value": {"code": 0, "stdout": json.dumps(out), "stderr": ""}}
+        # The real core. From another computer the address has the machine's name; here it has none.
+        r = subprocess.run(["hc", args[0], local(args[1])] + args[2:], capture_output=True, text=True, timeout=30)
+        return {"value": {"code": r.returncode, "stdout": r.stdout, "stderr": r.stderr}}
+    if kind == "file":
+        try:
+            with open(request[1], errors="replace") as f:
+                return {"value": f.read(1 << 20)}
+        except OSError as e:
+            return {"error": str(e)}
+    script, args, on = request[1], request[2], request[3]
+    if world.get("unreachable") and world["unreachable"] in args:
+        return {"error": "machine %s is unreachable" % on}
+    # A log still being written: before each look that reads it on (its file and offset
+    # at those places of the script's arguments), it has grown.
+    for g in world.get("growing", []):
+        if len(args) > g["offset"] and args[g["file"]] == g["path"] and g["stages"] and args[g["offset"]] not in g["read"]:
+            g["read"].add(args[g["offset"]])
+            with open(g["path"], "a") as f:
+                f.write(g["stages"].pop(0))
+    argv = ["sh", "-c", script, "sh"] + args
+    env = world.get("env", {})
+    if on and world.get("hc_exec"):
+        # As the app reaches another machine: `hc exec`, its output as base64 in JSON, at most 8 MiB.
+        cmd = ["hc", "exec", "--json", "--timeout", "30"] + [x for k, v in env.items() for x in ("--env", "%s=%s" % (k, v))] + ["--"] + argv
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        try:
+            v = json.loads(r.stdout.strip() or r.stderr.strip())
+        except ValueError:
+            return {"error": "hc exec: " + r.stderr.strip()[:200]}
+        if "error" in v:
+            return {"error": v["error"].get("message", "hc exec failed")}
+        text = lambda k: base64.b64decode(v.get(k) or "").decode(errors="replace")
+        return {"value": {"code": v.get("code", -1), "stdout": text("stdout"), "stderr": text("stderr")}}
+    r = subprocess.run(argv, capture_output=True, timeout=30, env={**os.environ, **env})
+    return {"value": {"code": r.returncode, "stdout": r.stdout[: 8 << 20].decode(errors="replace"), "stderr": r.stderr.decode(errors="replace")}}
+
+
+def settle(folder, cases, world):
+    """Asks the engine until every case has what it asked for: (each case's report, the answers)."""
+    answers = {}
+    for _ in range(40):
+        build(folder, cases, answers, "report")
+        _, text = engine(folder)
+        m = re.search(r"^(NEED|REPORT) (.*)$", text, re.M)
+        if not m:
+            sys.exit("the engine refused the mod:\n" + text)
+        found = json.loads(m.group(2))
+        if m.group(1) == "REPORT":
+            return found, answers
+        for request in found:
+            began = time.time()
+            answer = host(request, world)
+            answers[json.dumps(request, separators=(",", ":"), ensure_ascii=False)] = answer
+            size = len(answer["value"]["stdout"]) if isinstance(answer.get("value"), dict) else len(answer.get("value") or "")
+            world.setdefault("took", []).append("%5d ms %8d bytes  %s" % ((time.time() - began) * 1000, size, " ".join([request[0]] + ([str(request[3] or "here")] + request[2][:1] if request[0] == "sh" else request[1][:2] if request[0] == "hc" else [request[1]]))))
+    sys.exit("the cases never settled")
+
+
+def views(folder, cases, answers, reports, which):
+    for i in which:
+        rounds = len(reports[i].get("rounds") or [])
+        for opened in [None] + list(range(rounds)):
+            build(folder, cases, answers, "view", i, opened)
+            ok, text = engine(folder)
+            how = "as it opens" if opened is None else "round %d with every fold open" % (opened + 1)
+            check(ok, "the engine draws \"%s\", %s" % (cases[i]["name"], how), None if ok else text.strip()[:1200])
+
+
+def outputs(folder, cases, answers, i):
+    """A round still going, drawn with what its run printed: nothing yet, a few lines, a long run of them."""
+    long = "\n".join(("$ cargo test --all-features -- --nocapture" if n % 40 == 0 else "  exit 101" if n % 97 == 0 else
+                      "    " + "word " * (n % 50)) for n in range(3000))
+    for what, text, back in (("nothing printed yet", None, 0), ("a few lines, Markdown in them shown as it is", "• Reading the plan.\n  It says **three** steps.\n# not a heading\n1. not a list <b>nor html</b> \\ `x`", 0),
+                             ("3,000 lines, following the newest", long, 0), ("3,000 lines, scrolled up", long, 1200), ("3,000 lines, at the first", long, 3000)):
+        build(folder, cases, answers, "view", i, 0, {"text": text, "back": back} if text else None)
+        ok, out = engine(folder)
+        check(ok, "the engine draws \"%s\" with its output: %s" % (cases[i]["name"], what), None if ok else out.strip()[:1200])
+
+
+def sidebar(folder):
+    """The agents list's own rows (main.js): an agent's done count, folded and unfolded, its rows and footer."""
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    for name in ("thread.js", "conversation.js", "util.js", "mod.json"):
+        shutil.copy(os.path.join(MOD, name), folder)
+    shutil.copy(os.path.join(MOD, "main.js"), os.path.join(folder, "agents.js"))
+    shutil.copy(os.path.join(HERE, "sidebar.js"), os.path.join(folder, "main.js"))
+    ok, text = engine(folder)
+    check(ok, "the engine draws the agents list's rows: a done count folded and unfolded, done rows, the footer, short sub-agent names",
+          None if ok else text.strip()[:1200])
+
+
+def slim(step):
+    return {k: v for k, v in step.items() if k != "detail" and v is not None}
+
+
+def fixture_cases(fx):
+    rec = fx["records"]
+    whole = lambda a, program=None: {**rec[a], "address": a, "parent": ("vm/t1" if "/" in a else "t1"), "program": program}
+    # As the agents list first has a finished run: the short row of `hc ls`.
+    short = lambda a, program=None: {"address": a, "name": rec[a]["name"], "parent": ("vm/t1" if "/" in a else "t1"), "state": rec[a]["state"], "program": program}
+    thread = lambda name, program, addrs: {"name": name, "program": program, "asker": "Claude Code", "parent": "t1", "names": [name], "sessions": [], "addresses": addrs}
+    wrapper = fixtures.WRAPPER
+    return [
+        {"name": "codex through a wrapper, on another machine", "runs": [short("vm/t30")], "thread": thread("review-codex", CODEX, ["vm/t30"])},
+        {"name": "a codex follow-up that names its session", "runs": [whole("vm/t31")], "thread": thread("review-codex", CODEX, ["vm/t31"])},
+        {"name": "a codex conversation of two runs", "runs": [short("vm/t30"), short("vm/t31")], "thread": thread("review-codex", CODEX, ["vm/t30", "vm/t31"])},
+        {"name": "a codex run with an id on its command line that isn't a session", "runs": [whole("vm/t32")], "thread": thread("review-codex", CODEX, ["vm/t32"])},
+        {"name": "kimi through a wrapper", "runs": [short("t40", KIMI)], "thread": thread("review-kimi", KIMI, ["t40"])},
+        {"name": "a kimi follow-up that names its session", "runs": [whole("t41", KIMI)], "thread": thread("review-kimi", KIMI, ["t41"])},
+        {"name": "a codex run whose log isn't there", "runs": [whole("vm/t50")], "thread": thread("review-lost", CODEX, ["vm/t50"])},
+        {"name": "a program with request and answer labels", "runs": [whole("t60")], "thread": thread("lint", None, ["t60"])},
+        {"name": "a machine out of reach", "runs": [whole("vm/t70")], "thread": thread("review-far", CODEX, ["vm/t70"])},
+        {"name": "a codex from before 0.167", "runs": [whole("t80")], "thread": thread("review-old", CODEX, ["t80"])},
+        {"name": "a kimi conversation with a round still running", "runs": [whole("t40", KIMI), whole("t41", KIMI)], "live": [short("t90", KIMI)],
+         "thread": thread("review-kimi", KIMI, ["t40", "t41", "t90"])},
+        {"name": "a codex run still going, looked at three times", "live": [short("vm/t91")], "looks": 3, "thread": thread("review-live", CODEX, ["vm/t91"])},
+        {"name": "a kimi run still going", "live": [short("t92", KIMI)], "thread": thread("review-kimi-live", KIMI, ["t92"])},
+        {"name": "agy through relay", "runs": [short("t100", AGY)], "thread": thread("agy-notes-a1b2c3", AGY, ["t100"])},
+        {"name": "an agy conversation through run-reviewer.sh", "runs": [short("t101", AGY), short("t102", AGY)], "thread": thread("review-agy", AGY, ["t101", "t102"])},
+        {"name": "an agy run whose events file is older than it", "runs": [whole("t104", AGY)], "thread": thread("review-agy-stale", AGY, ["t104"])},
+        {"name": "an agy run whose events file a later run took over", "runs": [whole("t105", AGY)], "thread": thread("review-agy-later", AGY, ["t105"])},
+        {"name": "an agy run still going, looked at three times", "live": [short("t103", AGY)], "looks": 3, "thread": thread("agy-live-d4e5f6", AGY, ["t103"])},
+        {"name": "asked: a label", "ask": short("vm/t91")},
+        {"name": "asked: on the command line", "ask": short("t90", KIMI)},
+        {"name": "asked: through a wrapper", "ask": short("t92", KIMI)},
+        {"name": "asked: agy through run-reviewer.sh", "ask": short("t101", AGY)},
+        {"name": "splice: more printed", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 10)] + ["b1", "b2"], 3]},
+        {"name": "splice: nothing new", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 10)], 3]},
+        {"name": "splice: the last line rewritten", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["a%d" % n for n in range(5, 9)] + ["a9 done"], 3]},
+        {"name": "splice: they don't meet", "call": "spliceLines", "args": [["a%d" % n for n in range(10)], ["x", "y", "z", "w"], 3]},
+        {"name": "splice: blank lines prove nothing", "call": "spliceLines", "args": [["", "", "", "q"], ["", "", "", "r"], 3]},
+        {"name": "agentOf", "call": "agentOf", "args": [{"argv": [wrapper, "codex", "/w", "/b.md", "/r.md"]}]},
+        {"name": "agentOf: a script", "call": "agentOf", "args": [{"argv": ["sh", "-c", "cd w && ~/.kimi-code/bin/kimi -p hi"]}]},
+        {"name": "agentOf: what Herdr saw running", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": CODEX}]},
+        {"name": "agentOf: not an agent", "call": "agentOf", "args": [{"argv": ["grep", "codex", "notes.md"]}]},
+        {"name": "agentOf: agy through a wrapper", "call": "agentOf", "args": [{"argv": [wrapper, "agy", "/w", "/b.md", "/r.md"]}]},
+        {"name": "agentOf: agy as Herdr saw it", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "program": AGY}]},
+        {"name": "agentOf: agy by its report", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "status": {"app": "agy", "state": "working"}}]},
+        {"name": "agentOf: agy by its report in terminals()", "call": "agentOf", "args": [{"argv": ["/bin/bash"], "status": "working", "report": {"app": "agy", "state": "working"}}]},
+        {"name": "agentOf: not agy", "call": "agentOf", "args": [{"argv": ["grep", "agy", "notes.md"]}]},
+        {"name": "requestFromArgv: codex", "call": "requestFromArgv", "args": [["codex", "exec", "-c", "model=o3", "Review the patch in /tmp/r1.diff please"]]},
+        {"name": "requestFromArgv: kimi", "call": "requestFromArgv", "args": [["kimi", "-p", "Check it"]]},
+        {"name": "requestFromArgv: a script", "call": "requestFromArgv", "args": [["sh", "-c", "codex exec 'a long prompt that is here'"]]},
+        {"name": "requestFromArgv: agy --print=", "call": "requestFromArgv", "args": [["agy", "--print=Look at the docs", "--output-format", "stream-json"]]},
+        {"name": "requestFromArgv: agy -p", "call": "requestFromArgv", "args": [["/opt/agy/bin/agy", "-p", "Say hi", "--model", "gemini-4-neon-high"]]},
+        {"name": "requestFromArgv: agy's wrapper", "call": "requestFromArgv", "args": [[wrapper, "agy", "/w", "/b.md", "/r.md"]]},
+        {"name": "groupThreads", "call": "groupThreads", "args": [[
+            {"address": "a1", "parent": "t1", "name": "rev", "created_ms": 1},
+            {"address": "a2", "parent": "t1", "name": "rev-2", "labels": {"herdr.session": "s"}, "created_ms": 3},
+            {"address": "a3", "parent": "t1", "name": "rev", "labels": {"herdr.session": "s"}, "created_ms": 2},
+            {"address": "a4", "parent": "t1", "created_ms": 4},
+            {"address": "a6", "parent": "t2", "name": "rev", "created_ms": 6}]]},
+    ]
+
+
+def expect(fx, reports, answers):
+    t0, told = fx["t0"] * 1000, fx["told"] * 1000
+    by = {r["name"]: r for r in reports}
+    rounds = lambda name: by[name].get("rounds") or []
+    asked = lambda name: by[name].get("asked") or []
+    for r in reports:
+        if "error" in r:
+            check(False, "\"%s\" ran" % r["name"], r["error"])
+
+    name = "codex through a wrapper, on another machine"
+    (r,) = rounds(name) or [{}]
+    check(asked(name)[:2] == ["hc get vm/t30", "hc read vm/t30"] and [a.split(" ")[:2] for a in asked(name)[2:]] == [["sh", "vm"], ["sh", "vm"]],
+          "its record and screen come from the core, its session and log from scripts run on its machine", asked(name))
+    check(r.get("session") == fixtures.SID and r.get("request") == fixtures.REQUEST and r.get("answer") == fixtures.ANSWER and r.get("note") is None,
+          "codex: the session in its folder (reached through a link), not the one begun at the same moment elsewhere; the request without what codex adds; the final answer",
+          {k: r.get(k) for k in ("session", "request", "answer", "note")})
+    want = [
+        {"at": t0 + 5000, "kind": "say", "text": "Reading the patch first."},
+        {"at": t0 + 6000, "kind": "read", "text": "r1.diff", "ms": 5},
+        {"at": t0 + 20000, "kind": "run", "text": "cargo test -q 2>&1 | tail -5", "error": "exit 101", "ms": 12500},
+        {"at": t0 + 40000, "kind": "edit", "text": "src/terms.rs, /elsewhere/new.rs (new)"},
+        {"at": t0 + 50000, "kind": "search", "text": "spurious wakeup"},
+        {"at": t0 + 60000, "kind": "tool", "text": "GitHub: fetch https://github.com/a/b"},
+    ]
+    got = [slim(s) for s in r.get("work", [])]
+    check(got == want, "codex: what it said, the file it read, the command that failed with its exit code and time, its edits, a web search, an MCP call, in order", got)
+    check(r.get("work", [{}, {}])[1].get("detail") == "cat r1.diff", "a step keeps its whole command for its tooltip")
+    check((r.get("steps"), r.get("tokens"), r.get("cached")) == (5, 6700, 39000), "codex: 5 steps; 6,700 tokens read anew and written, 39,000 re-read from cache",
+          [r.get("steps"), r.get("tokens"), r.get("cached")])
+    check((r.get("at"), r.get("end"), r.get("transcript"), r.get("cut")) == (t0 + 2000, t0 + 82000, "output of vm/t30\nline 2", False),
+          "the round runs from the request to the run's end, with its terminal text", [r.get("at"), r.get("end"), r.get("transcript")])
+    log = [v for k, v in answers.items() if fixtures.SID in k and '"sh"' in k and "value" in v]
+    size = os.path.getsize([os.path.join(d, f) for d, _, fs in os.walk(fx["codex"]) for f in fs if fixtures.SID in f][0])
+    check(log and all(len(v["value"]["stdout"]) < 12000 for v in log), "codex: %d of the log's %d bytes cross over: no tool output, instructions or encrypted reasoning"
+          % (max(len(v["value"]["stdout"]) for v in log) if log else -1, size))
+
+    check([(x.get("model"), x.get("effort")) for x in rounds("a codex conversation of two runs")] == [("gpt-test", "low"), ("gpt-test", "high")]
+          and [(x.get("model"), x.get("effort")) for x in rounds("a kimi conversation with a round still running")][:2] == [("k-test", "max"), ("k-test", "high")],
+          "each round says the model and effort it ran with: codex's turn settings, kimi's first model request of the turn",
+          [(x.get("model"), x.get("effort")) for x in rounds("a codex conversation of two runs") + rounds("a kimi conversation with a round still running")])
+
+    name = "a codex follow-up that names its session"
+    (r,) = rounds(name) or [{}]
+    check(len([a for a in asked(name) if a.startswith("sh")]) == 1, "a session named on the command line is read at once, without a search", asked(name))
+    check((r.get("request"), r.get("answer"), [slim(s) for s in r.get("work", [])], r.get("steps"), r.get("tokens")) ==
+          ("Thanks. Now check the tests too.", "Tests look fine.", [{"at": t0 + 320000, "kind": "search", "text": "parse in tests", "ms": 5}], 1, 590),
+          "only the session's turn from while this run was alive", r)
+    rs = rounds("a codex conversation of two runs")
+    check([x.get("address") for x in rs] == ["vm/t30", "vm/t31"] and [x.get("answer") for x in rs] == [fixtures.ANSWER, "Tests look fine."],
+          "two runs of one session: two rounds, each with its own answer", [x.get("address") for x in rs])
+
+    name = "a codex run with an id on its command line that isn't a session"
+    (r,) = rounds(name) or [{}]
+    check((r.get("session"), r.get("request"), r.get("note")) == (fixtures.SID, fixtures.REQUEST, None) and len([a for a in asked(name) if a.startswith("sh")]) == 3,
+          "an id that names no session of this run: the session is looked for after all", [r.get("session"), r.get("note"), asked(name)])
+
+    name = "kimi through a wrapper"
+    (r,) = rounds(name) or [{}]
+    check([a.split(" ")[:2] for a in asked(name)[2:]] == [["sh", "here"], ["sh", "here"]], "a run on this computer is looked up here", asked(name))
+    check(r.get("session") == fixtures.KID and r.get("request") == fixtures.KREQUEST and r.get("answer") == fixtures.KANSWER and r.get("note") is None,
+          "kimi: the session in its folder; the request; the last step's text as the answer", {k: r.get(k) for k in ("session", "request", "answer", "note")})
+    want = [
+        {"at": t0 + 4000, "kind": "think", "text": "The user wants a review of staging. Let me read the plan first."},
+        {"at": t0 + 4000, "kind": "say", "text": "I'll read the plan first."},
+        {"at": t0 + 5000, "kind": "read", "text": "docs/plan.md", "ms": 22},
+        {"at": t0 + 10000, "kind": "run", "text": "pytest -q tests/test_detect.py", "error": True, "ms": 60000},
+        {"at": t0 + 71000, "kind": "edit", "text": "src/a.py", "ms": 3},
+        {"at": t0 + 72000, "kind": "plan", "text": "Updated its to-do list (3 items)", "ms": 1},
+        {"at": t0 + 73000, "kind": "tool", "text": "Agent", "ms": 900},
+    ]
+    got = [slim(s) for s in r.get("work", [])]
+    check(got == want, "kimi: its thinking, what it said, the file read, the command that failed, the edit (its path within the folder), its to-do list, a tool Herdr doesn't know", got)
+    check((r.get("steps"), r.get("tokens"), r.get("cached"), r.get("end")) == (5, 12000, 20000, t0 + 84000), "kimi: 5 steps; 12,000 tokens, 20,000 from cache",
+          [r.get("steps"), r.get("tokens"), r.get("cached")])
+    log = [v for k, v in answers.items() if fixtures.KID in k and '"sh"' in k and "value" in v]
+    check(log and all(len(v["value"]["stdout"]) < 6000 for v in log), "kimi: %d of the log's %d bytes cross over: no tool output, no file contents"
+          % (max(len(v["value"]["stdout"]) for v in log) if log else -1, os.path.getsize(os.path.join(fx["kimi"], "sessions/wd_kimi-ws_8653ff5eb128", fixtures.KID, "agents/main/wire.jsonl"))))
+    (r,) = rounds("a kimi follow-up that names its session") or [{}]
+    check((r.get("request"), r.get("answer"), r.get("steps"), r.get("tokens")) == ("And level 3?", "Level 3 is fine.", 0, 70) and
+          len([a for a in asked("a kimi follow-up that names its session") if a.startswith("sh")]) == 1, "kimi -S <session>: read at once, only that turn", r)
+
+    (r,) = rounds("a codex run whose log isn't there") or [{}]
+    check(r.get("note") == "Codex's own log of this run wasn't found on vm: 3 Codex sessions were active then, none in this run's folder."
+          and r.get("request") is None and r.get("answer") is None and r.get("transcript") == "output of vm/t50\nline 2",
+          "no session in the run's folder: its terminal text, and a line saying where it looked and what it found", r.get("note"))
+    name = "a program with request and answer labels"
+    (r,) = rounds(name) or [{}]
+    check((r.get("request"), r.get("answer"), r.get("note")) == ("Please review.\nCarefully.", "**LGTM**", None) and not [a for a in asked(name) if a.startswith("sh")],
+          "label files give the request and the answer of any program; nothing is searched", [r.get("request"), r.get("answer"), asked(name)])
+    (r,) = rounds("a machine out of reach") or [{}]
+    check(r.get("note") == "Codex's own log of this run couldn't be read on vm: machine vm is unreachable" and r.get("transcript") is not None,
+          "a machine that doesn't answer: the round still shows, saying so", r.get("note"))
+    (r,) = rounds("a codex from before 0.167") or [{}]
+    want = [
+        {"at": told + 3000, "kind": "think", "text": "Inspecting the allocator"},
+        {"at": told + 5000, "kind": "run", "text": 'rg -n "reserved(" src/'},
+        {"at": told + 20000, "kind": "say", "text": "Looking closer at the matcher."},
+        {"at": told + 30000, "kind": "edit", "text": "src/terms.rs"},
+        {"at": told + 31000, "kind": "search", "text": "spurious wakeup"},
+    ]
+    got = [slim(s) for s in r.get("work", [])]
+    check(got == want and (r.get("request"), r.get("answer"), r.get("steps"), r.get("tokens"), r.get("cut")) == ("Review the old way please, thoroughly", "All good.", 3, 3400, True),
+          "an older codex log (no record of what calls did): steps from the calls themselves", got)
+    rs = rounds("a kimi conversation with a round still running")
+    check(len(rs) == 3 and [x.get("live") for x in rs] == [False, False, True] and rs[-1].get("request") == "One more: check the docs as well.",
+          "a follow-up still running is the last round, with its request", [x.get("live") for x in rs])
+
+    check(rs[-1].get("note") == "Kimi's own log of this run wasn't found: 1 Kimi session was active then, none in this run's folder." and rs[-1].get("work") == [],
+          "a run still going whose log isn't found says so, and still shows its request", rs[-1].get("note"))
+
+    name = "a codex run still going, looked at three times"
+    one, two, three = (by[name].get("looks") or []) + [{}] * (3 - len(by[name].get("looks") or []))
+    said, read, ran, edit = "say Starting with the **parser**.", "read src/parse.rs", "run cargo check", "edit src/parse.rs"
+    check((one.get("steps"), one.get("answer"), one.get("done"), one.get("live")) == ([said, read], None, False, True),
+          "a codex run still going: what its log has so far, and no answer yet", one)
+    check((two.get("steps"), two.get("answer"), two.get("done")) == ([said, read, ran], None, False),
+          "the next look adds what was written since; a line only half written waits for its other half", two)
+    check((three.get("steps"), three.get("answer"), three.get("done"), three.get("live")) == ([said, read, ran, edit], "Parser is fine.", True, True),
+          "the look after its turn ended has the half line whole, and its answer", three)
+    check(asked(name) == ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]] + ["sh vm %s" % a for a in
+                          (str(fx["tl"] - 120), fixtures.LIVE, fixtures.LIVE, fixtures.LIVE)],
+          "the session is looked for once; after that each look is one read of the log, and the run's record isn't asked for again", asked(name))
+    on = [v["value"]["stdout"] for _, v in sorted(((int(json.loads(k)[2][-1]), v) for k, v in answers.items() if fx["live_file"] in k and "value" in v), key=lambda x: x[0])]
+    check(len(on) == 2 and all("cat src/parse.rs" not in o for o in on) and "cargo check" in on[0] and "cargo check" not in on[1] and "FileChange" in on[1] and "FileChange" not in on[0],
+          "a look that reads on gets only what is new: %s bytes" % " and ".join(str(len(o)) for o in on))
+    (r,) = rounds(name) or [{}]
+    check((r.get("request"), r.get("session"), r.get("steps"), r.get("tokens"), r.get("transcript")) == (fixtures.LREQUEST, fixtures.LIVE, 3, 1660, None),
+          "its request from its label, its session, its steps and tokens; no terminal text is fetched for a run still going",
+          [r.get("request"), r.get("session"), r.get("steps"), r.get("tokens")])
+
+    name = "a kimi run still going"
+    (r,) = rounds(name) or [{}]
+    kinds = [s["kind"] for s in r.get("work", [])]
+    check(kinds == ["think", "say"] + ["read"] * 14 + ["say"] and r.get("work", [{}])[-1].get("text") == "Half an ans" and r.get("answer") is None and r.get("live") is True
+          and (r.get("request"), r.get("session"), r.get("steps"), r.get("tokens"), r.get("end")) == ("Look at the docs.", fixtures.KLIVE, 14, 1000, None),
+          "a kimi run still going: its steps so far, what it is saying as a step, not as its answer", [kinds, r.get("answer"), r.get("steps"), r.get("tokens")])
+    check(r.get("work", [{}, {}])[1].get("detail") is None and r.get("work", [{}, {}])[1].get("text") == "Looking at the docs, *all* of them.",
+          "what it said is kept whole, for the window to show as Markdown")
+
+    agy_checks(fx, by, rounds, asked, answers)
+
+    result = lambda name: by[name].get("result")
+    a = ["a%d" % n for n in range(10)]
+    check([result("splice: more printed"), result("splice: nothing new"), result("splice: they don't meet"), result("splice: blank lines prove nothing")] ==
+          [{"lines": a + ["b1", "b2"], "from": 10}, {"lines": a, "from": 10}, None, None],
+          "what a running one prints is read on: new lines joined where the last look ended, nothing new said as such, a gap read again in full",
+          [result("splice: more printed"), result("splice: nothing new")])
+    check(result("splice: the last line rewritten") == {"lines": a[:9] + ["a9 done"], "from": 9}, "a line rewritten in place (a progress line) is taken as it is now",
+          result("splice: the last line rewritten"))
+    check((result("asked: a label"), asked("asked: a label")) == (fixtures.LREQUEST, ["hc get vm/t91", "file vm %s/live-req.md" % fx["files"]]),
+          "what a running one was asked, for the bar over its terminal: from its label's file, its log not read", asked("asked: a label"))
+    check((result("asked: on the command line"), asked("asked: on the command line")) == ("One more: check the docs as well.", ["hc get t90"]),
+          "from its command line, nothing else asked", asked("asked: on the command line"))
+    check(result("asked: through a wrapper") == "Look at the docs." and [a.split(" ")[0] for a in asked("asked: through a wrapper")] == ["hc", "hc", "sh", "sh"],
+          "through a wrapper, with no label: from its agent's log", [result("asked: through a wrapper"), asked("asked: through a wrapper")])
+    check([result(n) for n in ("agentOf", "agentOf: a script", "agentOf: what Herdr saw running", "agentOf: not an agent")] == ["codex", "kimi", "codex", None],
+          "whose log to look for: a wrapper's first argument, a script's words, what Herdr saw running; not any argument")
+    check([result(n) for n in ("requestFromArgv: codex", "requestFromArgv: kimi", "requestFromArgv: a script")] == ["Review the patch in /tmp/r1.diff please", "Check it", None],
+          "the request from a command line; none from a script")
+    check([[k["address"] for k in th["runs"]] for th in result("groupThreads") or []] == [["a1", "a3", "a2"], ["a4"], ["a6"]],
+          "runs group by parent and name, joined by a shared session; unnamed ones stand alone")
+
+
+def agy_checks(fx, by, rounds, asked, answers):
+    """Antigravity's runs, read from the events agy printed (relay's recording, and turns in its format)."""
+    said = "I will inspect the current directory, create `notes.txt` with the specified text, and display its contents."
+    recorded = [("say", said, None, None, 0), ("run", "ls -a", 291, None, 2069), ("edit", "notes.txt", 21, None, 4599), ("run", "cat notes.txt", 279, None, 6831)]
+    steps = lambda r: [(s.get("kind"), s.get("text"), s.get("ms"), s.get("error"), s.get("at", 0) - (r.get("at") or 0)) for s in r.get("work", [])]
+
+    name = "agy through relay"
+    (r,) = rounds(name) or [{}]
+    check((r.get("request"), r.get("answer"), r.get("session"), r.get("note"), r.get("model"), r.get("effort")) ==
+          (fixtures.AREQUEST, fixtures.AANSWER, fixtures.AGY, None, "gemini-3.8-flash", "low"),
+          "agy through relay: the request and answer from its labels' files, its session, the model and effort its init names",
+          {k: r.get(k) for k in ("request", "answer", "session", "note", "model", "effort")})
+    check(steps(r) == recorded, "agy: what it said before its first command, its commands, the file it wrote (within its folder), each with how long it took; "
+          "times from the run's start and the durations before each step", steps(r))
+    check((r.get("steps"), r.get("tokens"), r.get("cached")) == (3, 16508, 23093), "agy: 3 steps; 16,508 tokens read anew and written, 23,093 re-read from cache",
+          [r.get("steps"), r.get("tokens"), r.get("cached")])
+    check(asked(name) == ["hc get t100", "hc read t100", "file here %s/brief.md" % fx["agy_rd"], "file here %s/report.md" % fx["agy_rd"], "sh here 4000000"],
+          "agy with its session labelled: one read of the events file beside its answer, nothing looked for", asked(name))
+    got = [v["value"]["stdout"] for k, v in answers.items() if fx["agy_rd"] + "/events.jsonl" in k and "value" in v]
+    size = os.path.getsize(fx["agy_rd"] + "/events.jsonl")
+    check(len(got) == 1 and len(got[0]) < 20000 and '"output":"Command exited with code 0"' in got[0] and "Warning" not in got[0] and "quoted" not in got[0],
+          "agy: %s of the events file's %d bytes cross over: no command output (its exit code kept), no stderr lines" % ([len(g) for g in got], size))
+
+    name = "an agy conversation through run-reviewer.sh"
+    rs = rounds(name)
+    one, two = (rs + [{}, {}])[:2]
+    check((one.get("request"), one.get("session"), one.get("note"), steps(one)) == (fixtures.AREQUEST, fixtures.AGY, None, recorded)
+          and one.get("answer", "").startswith("I listed the directory contents") and "I will inspect" not in one.get("answer", ""),
+          "agy through run-reviewer.sh, no labels: the request from its brief (a path within its folder), its events from REPORT.events, "
+          "the answer the text after its last command (not its result's, which has what it said before)", {k: one.get(k) for k in ("request", "session", "note", "answer")})
+    want = [("run", "false", 2500, "exit 1"), ("read", "gone.md", 2500, "file does not exist"), ("search", "TODO in src", 2500, None), ("tool", "browser_click_element", 2500, None)]
+    check((two.get("request"), two.get("answer"), two.get("session"), [s[:4] for s in steps(two)]) ==
+          (fixtures.ABRIEF2, "Second answer, **after** the tools.", fixtures.AGY, want),
+          "its follow-up (the conversation on its command line): a command that failed with its exit code, a read that failed with why, a search, "
+          "a tool Herdr doesn't know", [two.get("request"), two.get("answer"), [s[:4] for s in steps(two)]])
+    check((two.get("model"), two.get("effort"), two.get("tokens"), two.get("cached"), two.get("steps")) == ("gemini-4-neon", "xhigh", 1657, 160700, 4),
+          "the follow-up's model and effort, and its own tokens: its steps' sum, not its result's (the whole conversation's)",
+          [two.get(k) for k in ("model", "effort", "tokens", "cached", "steps")])
+    check([a.split(" ")[0] for a in asked(name)] == ["hc", "hc", "file", "sh", "sh", "hc", "hc", "file", "sh"],
+          "the first round's events are looked for (no session known), the follow-up's read at once", asked(name))
+
+    for name, why in (("an agy run whose events file is older than it", "the file there is older than the run (another run's)"),
+                      ("an agy run whose events file a later run took over", "the file there was written again after the run ended (a later run's)")):
+        (r,) = rounds(name) or [{}]
+        check((r.get("note"), r.get("work"), r.get("request"), bool(r.get("transcript"))) ==
+              ("Antigravity's events of this run weren't found: %s." % why, [], fixtures.AREQUEST, True),
+              "%s: not read as its own; a note says why, with its request and its terminal's text" % name, r.get("note"))
+
+    name = "an agy run still going, looked at three times"
+    one, two, three = (by[name].get("looks") or []) + [{}] * (3 - len(by[name].get("looks") or []))
+    first = ["say " + said, "run ls -a"]
+    check((one.get("steps"), one.get("answer"), one.get("done"), one.get("live")) == (first, None, False, True),
+          "an agy run still going: what its events have so far, and no answer yet", one)
+    check((two.get("steps"), two.get("answer"), two.get("done")) == (first + ["edit notes.txt", "run cat notes.txt", "say I listed the directory content"], None, False),
+          "the next look adds what was printed since, what it is saying as a step; a line only half written waits for its other half", two)
+    check((three.get("steps"), three.get("done"), three.get("live")) == (first + ["edit notes.txt", "run cat notes.txt"], True, True)
+          and str(three.get("answer")).startswith("I listed the directory contents using `ls -a`"),
+          "the look after its result has its answer", three)
+    check(asked(name) == ["hc get t103", "file here %s/brief.md" % os.path.dirname(fx["agy_live"]), "sh here %d" % (fx["agy_tl"] - 2)] + ["sh here 4000000"] * 3,
+          "its events file is looked for once; after that each look is one read of it", asked(name))
+    on = [v["value"]["stdout"] for _, v in sorted(((int(json.loads(k)[2][2]), v) for k, v in answers.items()
+                                                   if json.loads(k)[0] == "sh" and json.loads(k)[2][1] == fx["agy_live"] and "value" in v), key=lambda x: x[0])]
+    check(len(on) == 2 and all('"CommandLine":"ls -a"' not in o for o in on) and "write_file" in on[0] and '"result"' in on[1] and "write_file" not in on[1],
+          "a look that reads on gets only what is new: %s bytes" % " and ".join(str(len(o)) for o in on))
+    (r,) = rounds(name) or [{}]
+    check((r.get("request"), r.get("session"), r.get("steps"), r.get("tokens"), r.get("transcript")) == (fixtures.ALREQUEST, fixtures.AGY, 3, 16508, None),
+          "its request from its label, its session from its events, its steps and tokens", [r.get(k) for k in ("request", "session", "steps", "tokens")])
+
+    result = lambda name: by[name].get("result")
+    check((result("asked: agy through run-reviewer.sh"), asked("asked: agy through run-reviewer.sh")) ==
+          (fixtures.AREQUEST, ["hc get t101", "file here %s/agy-ws/../agy-brief.md" % fx["ws"]]),
+          "what an agy run was asked, for the bar over its terminal: its brief, its events not read", asked("asked: agy through run-reviewer.sh"))
+    check([result(n) for n in ("agentOf: agy through a wrapper", "agentOf: agy as Herdr saw it", "agentOf: agy by its report", "agentOf: agy by its report in terminals()",
+                               "agentOf: not agy")] == ["agy", "agy", "agy", "agy", None],
+          "agy is known by its wrapper's first argument, by what Herdr saw running, by its own report; not by any argument")
+    check([result(n) for n in ("requestFromArgv: agy --print=", "requestFromArgv: agy -p", "requestFromArgv: agy's wrapper")] == ["Look at the docs", "Say hi", None],
+          "agy's prompt from --print= or -p; none from its wrapper's command line")
+
+
+def real_cases(addresses, machine, together, looks=1):
+    rows = {t["address"]: t for t in json.loads(subprocess.run(["hc", "ls", "--all", "--json"], capture_output=True, text=True).stdout)["terminals"]}
+    at = lambda a: "%s/%s" % (machine, a) if machine else a
+    runs = []
+    for a in addresses:
+        if a not in rows:
+            sys.exit("herdr-core has no terminal %s" % a)
+        t = rows[a]
+        runs.append({"address": at(a), "name": t.get("name"), "parent": at(t["parent"]) if t.get("parent") else None, "state": t["state"], "program": None})
+    groups = [runs] if together else [[r] for r in runs]
+    return [{"name": " + ".join(local(r["address"]) for r in g), "brief": True, "looks": looks, ("live" if g[0]["state"] == "live" else "runs"): g,
+             "thread": {"name": g[0]["name"] or g[0]["address"], "program": None, "asker": "Parent", "parent": g[0]["parent"], "names": [], "sessions": [], "addresses": [r["address"] for r in g]}}
+            for g in groups]
+
+
+def terminal_lines(text):
+    """A terminal's lines as the mod takes them (thread.js terminalLines)."""
+    lines = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text.replace("\t", "    ")).split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def splice_check(folder):
+    """Reads a terminal that prints in bursts the way the window does, in a core of its own."""
+    state = tempfile.mkdtemp(prefix="splice-core-")
+    env = {**os.environ, "HC_SESSION": "agents-mod-splice-%d" % os.getpid(), "XDG_STATE_HOME": state}
+    env.pop("HC_TERMINAL_ID", None)
+    hc = lambda *args: subprocess.run(["hc", *args], capture_output=True, text=True, env=env, timeout=60)
+    # Bursts of 7, 40, 0, 230 and 600 lines, one every 3 s; long lines and blank ones among them.
+    script = 'n=0; for b in 7 40 0 230 600; do sleep 3; i=0; while [ $i -lt $b ]; do n=$((n+1)); i=$((i+1)); ' \
+             'if [ $((n % 13)) = 0 ]; then echo; elif [ $((n % 17)) = 0 ]; then printf "line %d %0300d\\n" $n 0; else echo "line $n of the probe"; fi; done; done; sleep 60'
+    try:
+        made = hc("run", "--bg", "--json", "--no-parent", "--name", "splice-probe", "--", "bash", "-c", script)
+        address = json.loads(made.stdout)["address"]
+        read = lambda n: terminal_lines(json.loads(hc("read", address, "--lines", str(n), "--json").stdout)["text"])
+        time.sleep(1.5)
+        cases, wanted = [], []
+        old = read(5000)
+        for burst in range(5):
+            time.sleep(3)
+            fresh, now = read(150), read(5000)
+            cases.append({"name": "burst %d" % burst, "call": "spliceLines", "args": [old, fresh]})
+            wanted.append((len(now) - len(old), now, len(old)))
+            old = now
+        build(folder, cases, {}, "report")
+        _, text = engine(folder)
+        found = json.loads(re.search(r"^REPORT (.*)$", text, re.M).group(1))
+        for (added, now, had), got in zip(wanted, found):
+            result = got.get("result")
+            if not had:
+                check(result is None, "nothing read before: all of it is read (%d lines)" % len(now), got)
+            elif result is None:
+                check(added >= 150, "%d lines printed between two looks: they don't meet, so all is read again" % added, got)
+            else:
+                check(result["lines"] == now, "%d lines printed between two looks: the join is exactly what a full read gives (%d lines)" % (added, len(now)),
+                      {"got": len(result["lines"]), "want": len(now)})
+    finally:
+        hc("server", "stop")
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--real", nargs="+", metavar="ADDRESS")
+    p.add_argument("--as", dest="machine", metavar="MACHINE")
+    p.add_argument("--together", action="store_true")
+    p.add_argument("--looks", type=int, default=1, metavar="N")
+    p.add_argument("--splice", action="store_true")
+    a = p.parse_args()
+    if not shutil.which("herdr-app"):
+        sys.exit("herdr-app isn't on PATH")
+    with tempfile.TemporaryDirectory(prefix="agents-mod-check-") as tmp:
+        folder = os.path.join(tmp, "agents-check")
+        if a.splice:
+            splice_check(folder)
+        elif a.real:
+            cases = real_cases(a.real, a.machine, a.together, a.looks)
+            world = {"hc_exec": bool(a.machine)}
+            reports, answers = settle(folder, cases, world)
+            print(json.dumps(reports, indent=1))
+            print("what the mod asked for, how long it took and how much came back:\n  " + "\n  ".join(world.get("took", [])))
+            views(folder, cases, answers, reports, range(len(cases)))
+        else:
+            fx = fixtures.make(os.path.join(tmp, "fixtures"))
+            cases = fixture_cases(fx)
+            # Runs addressed vm/... go through `hc exec` when a core is there to ask, as in the app.
+            core = subprocess.run(["hc", "exec", "--json", "--", "true"], capture_output=True).returncode == 0 if shutil.which("hc") else False
+            # The logs still being written: codex's arguments are (session, from, to, limit, file, offset), agy's (limit, file, offset, ...).
+            growing = [{"path": fx["live_file"], "file": 4, "offset": 5, "stages": list(fx["stages"]), "read": set()},
+                       {"path": fx["agy_live"], "file": 1, "offset": 2, "stages": list(fx["agy_stages"]), "read": set()}]
+            world = {"records": fx["records"], "screens": fx["screens"], "env": {"CODEX_HOME": fx["codex"], "KIMI_CODE_HOME": fx["kimi"]},
+                     "hc_exec": core, "unreachable": fx["ws"], "growing": growing}
+            reports, answers = settle(folder, cases, world)
+            expect(fx, reports, answers)
+            print("     (scripts for vm/... ran %s)" % ("through hc exec" if core else "directly: no herdr-core to go through"))
+            views(folder, cases, answers, reports, [i for i, c in enumerate(cases) if "thread" in c])
+            sidebar(folder)
+            # A round whose turn isn't over: the window draws its output panel.
+            outputs(folder, cases, answers, next(i for i, c in enumerate(cases) if c["name"] == "a kimi run still going"))
+    print("%d failed" % failed if failed else "all passed")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
