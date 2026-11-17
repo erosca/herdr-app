@@ -24,6 +24,39 @@ changed settings files are backed up first. Then quit Herdr and open it again.
 A server you only reach through Herdr's SSH machines needs nothing from here:
 just herdr-core, which Herdr sets up when you add the machine.
 
+## Another Ubuntu machine, without building
+
+On a machine that has the build:
+
+```sh
+personal/package.sh --no-build   # packs target/release/herdr-app; without --no-build it builds first
+```
+
+It writes `dist/herdr-app-personal-<version>-<commit>-<cpu>.tar.xz` and a
+`.sha256` beside it: the app, the launcher template and everything in the
+table below. Copy the archive to the other machine, then:
+
+```sh
+tar -xf herdr-app-personal-*.tar.xz
+herdr-app-personal-*/install.sh   # add --nomachine on a NoMachine desktop
+```
+
+The installer needs no git, Rust or root.
+
+- **Checks first:** the CPU type, the glibc version, and the libraries the app
+  links. For missing ones it prints the `sudo apt install` line and stops.
+- **Then installs:** it copies the build to `~/.local/opt/herdr-app-personal/`
+  and runs the bundled `setup.sh --no-build`. That gives the same launcher,
+  menu entry, settings, agents and `~/.inputrc` lines as `setup.sh` does here.
+- **herdr-core** still comes from releases.herdr.dev. `--no-core` skips it,
+  and Herdr offers it when it opens.
+- **Older builds:** it keeps the two newest, so a Herdr that's still running
+  keeps working until you reopen it. The unpacked folder can be deleted.
+
+Pack on the oldest Ubuntu you install to, because the app needs at least the
+glibc it was built with. The archive holds a plain build, so it never updates
+itself to upstream's release.
+
 ## What it applies
 
 | File | Goes to | Notes |

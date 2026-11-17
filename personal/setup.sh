@@ -13,18 +13,20 @@
 #     --no-build      use the existing target/release/herdr-app
 #     --no-core       don't install herdr-core when it's missing
 #     --config-only   only the settings and agents (no build, core or launcher)
+#     --build-only    only the build (personal/package.sh uses it)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
-nomachine=false build=true core=true launcher=true
+nomachine=false build=true core=true launcher=true build_only=false
 for arg in "$@"; do
   case $arg in
     --nomachine) nomachine=true ;;
     --no-build) build=false ;;
     --no-core) core=false ;;
     --config-only) build=false core=false launcher=false ;;
-    -h | --help) sed -n '2,15p' "$0"; exit 0 ;;
+    --build-only) build_only=true ;;
+    -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown option $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -77,6 +79,11 @@ The build failed. On Debian/Ubuntu these packages are what CI installs:
 EOF
     exit 1
   fi
+fi
+if $build_only; then
+  $build || { echo "--build-only and --no-build: nothing to do" >&2; exit 2; }
+  say "Built $app"
+  exit 0
 fi
 
 if $core; then
